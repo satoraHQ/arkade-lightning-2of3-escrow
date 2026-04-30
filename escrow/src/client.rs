@@ -9,7 +9,9 @@ use bitcoin::{Psbt, Txid};
 use rand::rngs::OsRng;
 
 use crate::contract::EscrowContract;
+#[allow(deprecated)]
 use crate::delegate::DelegateVtxo;
+use crate::refresh::{RefreshIntent, RefreshVtxo};
 use crate::spend::{self, EscrowVtxo};
 use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
 
@@ -73,10 +75,10 @@ impl EscrowClient {
     /// Returns `(vtxos, any_recoverable)` where `vtxos` contains all unspent
     /// VTXOs at the escrow address and `any_recoverable` is true if offchain
     /// spending is not possible for at least one of them.
-    pub async fn find_escrow_vtxos(
+    pub async fn find_refresh_vtxos(
         &self,
         contract: &EscrowContract,
-    ) -> Result<(Vec<DelegateVtxo>, bool)> {
+    ) -> Result<(Vec<RefreshVtxo>, bool)> {
         let info = self.server_info()?;
         let address = contract.address();
 
@@ -93,7 +95,7 @@ impl EscrowClient {
         let mut any_recoverable = false;
 
         for v in vtxo_list.spendable_offchain() {
-            vtxos.push(DelegateVtxo {
+            vtxos.push(RefreshVtxo {
                 outpoint: v.outpoint,
                 amount: v.amount,
                 is_swept: v.is_swept,
@@ -102,7 +104,7 @@ impl EscrowClient {
 
         for v in vtxo_list.recoverable() {
             any_recoverable = true;
-            vtxos.push(DelegateVtxo {
+            vtxos.push(RefreshVtxo {
                 outpoint: v.outpoint,
                 amount: v.amount,
                 is_swept: v.is_swept,
@@ -112,18 +114,60 @@ impl EscrowClient {
         Ok((vtxos, any_recoverable))
     }
 
-    /// Execute a delegate settlement via the Arkade batch ceremony.
+    /// Find all unspent escrow VTXOs and check recoverability.
     ///
-    /// The `delegate` must contain fully-signed intent + forfeit PSBTs (signed
-    /// by all escrow-leaf parties). The `cosigner_kp` is the delegate cosigner
-    /// keypair whose public key was committed in the intent message.
+    /// Deprecated: use [`EscrowClient::find_refresh_vtxos`] for refresh flows.
+    #[allow(deprecated)]
+    pub async fn find_escrow_vtxos(
+        &self,
+        contract: &EscrowContract,
+    ) -> Result<(Vec<DelegateVtxo>, bool)> {
+        let (vtxos, any_recoverable) = self.find_refresh_vtxos(contract).await?;
+        Ok((
+            vtxos
+                .into_iter()
+                .map(|v| DelegateVtxo {
+                    outpoint: v.outpoint,
+                    amount: v.amount,
+                    is_swept: v.is_swept,
+                })
+                .collect(),
+            any_recoverable,
+        ))
+    }
+
+    /// Execute a refresh via the Arkade batch ceremony.
+    ///
+    /// The `refresh` must contain fully-signed intent + forfeit PSBTs (signed
+    /// by all selected escrow-leaf parties). The `refresh_cosigner_kp` is the
+    /// refresh cosigner keypair whose public key was committed in the intent.
     ///
     /// Blocks until the batch ceremony completes (~10-30s). Returns the
     /// commitment transaction ID.
+    pub async fn refresh_escrow(
+        &self,
+        refresh: RefreshIntent,
+        refresh_cosigner_kp: Keypair,
+    ) -> Result<Txid> {
+        let info = self.server_info()?;
+        let mut rng = OsRng;
+
+        crate::refresh::execute_refresh(&self.grpc, info, &mut rng, refresh, refresh_cosigner_kp)
+            .await
+    }
+
+    /// Execute a delegate settlement via the Arkade batch ceremony.
+    ///
+    /// Deprecated: use [`EscrowClient::refresh_escrow`] for recoverable escrow
+    /// VTXOs, then perform the normal offchain release/refund flow.
+    #[deprecated(
+        note = "direct delegate settlement is legacy; use refresh_escrow followed by normal offchain release/refund"
+    )]
     pub async fn settle_delegate(&self, delegate: Delegate, cosigner_kp: Keypair) -> Result<Txid> {
         let info = self.server_info()?;
         let mut rng = OsRng;
 
+        #[allow(deprecated)]
         crate::delegate::settle_delegate(&self.grpc, info, &mut rng, delegate, cosigner_kp).await
     }
 

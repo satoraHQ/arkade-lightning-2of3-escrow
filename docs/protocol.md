@@ -93,6 +93,22 @@ signatures can be collected before the Arkade server sees the checkpoints.
 
 Same protocol but uses the **Alice + Arbiter + Server** collaborative leaf via `build_refund_tx()`. Alice signs instead of Bob, and funds return to Alice's address.
 
+## Refresh Flow for Recoverable VTXOs
+
+If the escrow VTXO is recoverable rather than spendable, do not release/refund it directly via settlement. Settlement cannot create sub-dust outputs, while release may include small platform/referral fee outputs.
+
+Instead, first **refresh** the escrow contract:
+
+1. Arbiter calls `prepare_refresh(contract, vtxos, RefreshPath::Release, ...)` for release, or `RefreshPath::Refund` for refund.
+2. The refresh intent creates a single output back to the same escrow address for the full input sum.
+3. Bob signs the refresh for release; Alice signs it for refund. The arbiter also signs.
+4. Arbiter calls `refresh_escrow(...)`.
+5. Once the refreshed escrow VTXO is visible/spendable, run the normal release/refund flow above.
+
+This means recoverable release/refund requires two signing rounds: one refresh round, then one normal offchain release/refund round.
+
+Legacy direct delegated release APIs remain available for compatibility, but are deprecated.
+
 ## Unilateral Exit
 
 If the Arkade server is unavailable, any collaborative path can be replaced by its unilateral counterpart after the CSV delay expires. The unilateral paths require only 2 of the 3 user parties (no server signature needed).

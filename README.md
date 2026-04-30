@@ -28,11 +28,11 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 ### Core types
 
 - **`EscrowContract`** — builds the taproot tree from 4 public keys + CSV delay
-- **`EscrowClient`** — wraps Arkade gRPC (connect, find VTXOs, offchain spend with crash recovery, delegate settlement)
+- **`EscrowClient`** — wraps Arkade gRPC (connect, find VTXOs, offchain spend with crash recovery, escrow refresh)
 - **`build_release_tx`** / **`build_refund_tx`** — construct unsigned offchain release/refund PSBTs
-- **`prepare_release_delegate`** — construct unsigned delegate settlement PSBTs (for recoverable VTXOs)
+- **`prepare_refresh`** — construct unsigned refresh PSBTs for recoverable VTXOs
 - **`plan_release`** — compute effective payout and fee outputs without building PSBTs
-- **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_delegate`** — Schnorr signing helpers
+- **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_refresh`** — Schnorr signing helpers
 - **`merge_ark_tx_sigs`** — merge signatures from multiple parties
 - **`SpendStore`** trait — pluggable crash-recovery storage for the two-phase offchain spend protocol
 
@@ -123,26 +123,27 @@ ark_txid = client.spend_escrow_offchain(
 )
 ```
 
-### Delegate settlement (recoverable VTXOs)
+### Refreshing recoverable VTXOs
 
-When escrow VTXOs become recoverable (expired from the VTXO tree), the offchain spend path is no longer available. Instead, use delegate settlement via an Arkade batch ceremony:
+When escrow VTXOs become recoverable, first refresh them back into the same escrow contract address. The refreshed escrow then becomes spendable again and should be released/refunded using the normal offchain flow. This avoids direct settlement outputs for fees/referrals, which may be sub-dust.
 
 ```ruby
 # Check VTXO status
 pending, vtxos, any_recoverable = client.get_escrow_vtxo_status(trade_id, contract)
 
-# Quote the release (accounts for dust filtering in delegate mode)
-bob_amount, effective_fees, discarded_fees =
-  client.quote_release(escrow_amount, fee_outputs, any_recoverable)
-
-# Prepare + sign + settle
+# Prepare + sign + refresh for release. Use "refund" for refund flows.
 intent_b64, message_json, forfeit_b64s, cosigner_pk =
-  client.prepare_release_delegate(contract, vtxos, bob_dest, fee_outputs, cosigner_sk)
+  client.prepare_refresh(contract, vtxos, "release", cosigner_sk)
 
-signed_intent, signed_forfeits = ArkEscrow.sign_delegate(intent_b64, forfeit_b64s, bob_sk)
+signed_intent, signed_forfeits = ArkEscrow.sign_refresh(intent_b64, forfeit_b64s, bob_sk)
 # ... merge arbiter + bob sigs, then:
-txid = client.settle_delegate(signed_intent, message_json, signed_forfeits, cosigner_sk)
+txid = client.refresh_escrow(signed_intent, message_json, signed_forfeits, cosigner_sk)
+
+# Once the refreshed VTXO is visible/spendable, use build_release/build_refund.
+outpoint, amount = client.find_escrow_vtxo(contract)
 ```
+
+Legacy direct delegated release methods remain for compatibility, but are deprecated.
 
 ### Rust logging
 

@@ -2,7 +2,9 @@ use std::sync::Mutex;
 
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions};
+#[allow(deprecated)]
 use ark_escrow::delegate::{self, DelegateVtxo};
+use ark_escrow::refresh::{self, RefreshIntent, RefreshPath, RefreshVtxo};
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
@@ -68,6 +70,23 @@ fn psbt_from_base64(s: &str) -> Result<Psbt, Error> {
     use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
     let bytes = STANDARD.decode(s).map_err(to_magnus_err)?;
     Psbt::deserialize(&bytes).map_err(to_magnus_err)
+}
+
+fn parse_refresh_path(path: &str) -> Result<RefreshPath, Error> {
+    match path {
+        "release" => Ok(RefreshPath::Release),
+        "refund" => Ok(RefreshPath::Refund),
+        _ => Err(to_magnus_err(format!(
+            "unknown refresh path: {path}; expected 'release' or 'refund'"
+        ))),
+    }
+}
+
+fn warn_deprecated(message: &str) {
+    match Ruby::get() {
+        Ok(ruby) => ruby.warning(message),
+        Err(_) => eprintln!("warning: {message}"),
+    }
 }
 
 fn parse_fee_outputs(fee_outputs: Vec<(String, u64)>) -> Result<Vec<FeeOutput>, Error> {
@@ -264,20 +283,30 @@ impl RbClient {
     /// offchain spend status is currently inferred separately from the local
     /// [`SpendStore`] until Arkade surfaces that status explicitly.
     #[allow(clippy::type_complexity)]
-    fn find_escrow_vtxos(
+    fn find_refresh_vtxos(
         &self,
         contract: &RbContract,
     ) -> Result<(Vec<(String, u64, bool)>, bool), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let (vtxos, any_recoverable) = self
             .rt
-            .block_on(client.find_escrow_vtxos(&contract.inner))
+            .block_on(client.find_refresh_vtxos(&contract.inner))
             .map_err(to_magnus_err)?;
         let vtxo_data: Vec<(String, u64, bool)> = vtxos
             .iter()
             .map(|v| (v.outpoint.to_string(), v.amount.to_sat(), v.is_swept))
             .collect();
         Ok((vtxo_data, any_recoverable))
+    }
+
+    /// Find all unspent escrow VTXOs and check recoverability.
+    #[allow(clippy::type_complexity)]
+    #[allow(deprecated)]
+    fn find_escrow_vtxos(
+        &self,
+        contract: &RbContract,
+    ) -> Result<(Vec<(String, u64, bool)>, bool), Error> {
+        self.find_refresh_vtxos(contract)
     }
 
     /// Get escrow VTXO status for control-flow decisions.
@@ -293,6 +322,7 @@ impl RbClient {
     /// Once Arkade exposes pending spend status explicitly for escrow VTXOs,
     /// this method should source that signal from Arkade instead.
     #[allow(clippy::type_complexity)]
+    #[allow(deprecated)]
     fn get_escrow_vtxo_status(
         &self,
         id: String,
@@ -302,7 +332,7 @@ impl RbClient {
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let (vtxos, any_recoverable) = self
             .rt
-            .block_on(client.find_escrow_vtxos(&contract.inner))
+            .block_on(client.find_refresh_vtxos(&contract.inner))
             .map_err(to_magnus_err)?;
         let vtxo_data: Vec<(String, u64, bool)> = vtxos
             .iter()
@@ -322,6 +352,11 @@ impl RbClient {
         fee_outputs: Vec<(String, u64)>,
         use_delegate: bool,
     ) -> Result<(u64, Vec<(String, u64)>, Vec<(String, u64)>), Error> {
+        if use_delegate {
+            warn_deprecated(
+                "ArkEscrow: quote_release(..., use_delegate: true) is legacy; refresh first, then quote/build the normal offchain release",
+            );
+        }
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let info = client.server_info().map_err(to_magnus_err)?;
         let fee_outputs = parse_fee_outputs(fee_outputs)?;
@@ -355,9 +390,60 @@ impl RbClient {
         ))
     }
 
-    /// Prepare unsigned delegate release PSBTs.
+    /// Prepare unsigned refresh PSBTs.
     ///
     /// Returns `[intent_proof_b64, intent_message_json, forfeit_psbts_b64[], cosigner_pk_hex]`.
+    fn prepare_refresh(
+        &self,
+        contract: &RbContract,
+        vtxos_data: Vec<(String, u64, bool)>,
+        path: String,
+        cosigner_sk_hex: String,
+    ) -> Result<(String, String, Vec<String>, String), Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let info = client.server_info().map_err(to_magnus_err)?;
+
+        let vtxos: Vec<RefreshVtxo> = vtxos_data
+            .into_iter()
+            .map(|(outpoint_str, amount_sats, is_swept)| {
+                let outpoint: bitcoin::OutPoint = outpoint_str.parse().map_err(to_magnus_err)?;
+                Ok(RefreshVtxo {
+                    outpoint,
+                    amount: Amount::from_sat(amount_sats),
+                    is_swept,
+                })
+            })
+            .collect::<Result<_, Error>>()?;
+
+        let path = parse_refresh_path(&path)?;
+        let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
+        let cosigner_pk = cosigner_kp.public_key();
+
+        let refresh = refresh::prepare_refresh(&contract.inner, &vtxos, path, cosigner_pk, info)
+            .map_err(to_magnus_err)?;
+
+        let intent_proof_b64 = psbt_to_base64(&refresh.intent.proof);
+        let intent_message_json = refresh.intent.serialize_message().map_err(to_magnus_err)?;
+        let forfeit_psbts_b64: Vec<String> =
+            refresh.forfeit_psbts.iter().map(psbt_to_base64).collect();
+        let cosigner_pk_hex =
+            bitcoin::hex::DisplayHex::to_lower_hex_string(&refresh.refresh_cosigner_pk.serialize());
+
+        Ok((
+            intent_proof_b64,
+            intent_message_json,
+            forfeit_psbts_b64,
+            cosigner_pk_hex,
+        ))
+    }
+
+    /// Prepare unsigned delegate release PSBTs.
+    ///
+    /// Deprecated: use `prepare_refresh(contract, vtxos, "release", cosigner_sk)`
+    /// followed by the normal offchain release flow.
+    ///
+    /// Returns `[intent_proof_b64, intent_message_json, forfeit_psbts_b64[], cosigner_pk_hex]`.
+    #[allow(deprecated)]
     fn prepare_release_delegate(
         &self,
         contract: &RbContract,
@@ -366,6 +452,9 @@ impl RbClient {
         fee_outputs: Vec<(String, u64)>,
         cosigner_sk_hex: String,
     ) -> Result<(String, String, Vec<String>, String), Error> {
+        warn_deprecated(
+            "ArkEscrow: prepare_release_delegate is deprecated; use prepare_refresh(..., 'release') followed by normal offchain release",
+        );
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let info = client.server_info().map_err(to_magnus_err)?;
 
@@ -411,10 +500,51 @@ impl RbClient {
         ))
     }
 
+    /// Refresh the escrow contract. Blocks until the batch ceremony completes.
+    ///
+    /// Takes the fully-signed refresh PSBTs and returns the commitment
+    /// transaction ID (hex string).
+    fn refresh_escrow(
+        &self,
+        intent_proof_b64: String,
+        intent_message_json: String,
+        forfeit_psbts_b64: Vec<String>,
+        cosigner_sk_hex: String,
+    ) -> Result<String, Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?;
+
+        let intent_proof = psbt_from_base64(&intent_proof_b64)?;
+        let intent_message: ark_core::intent::IntentMessage =
+            serde_json::from_str(&intent_message_json).map_err(to_magnus_err)?;
+        let forfeit_psbts: Vec<Psbt> = forfeit_psbts_b64
+            .iter()
+            .map(|b| psbt_from_base64(b))
+            .collect::<Result<_, _>>()?;
+
+        let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
+
+        let refresh = RefreshIntent {
+            intent: ark_core::intent::Intent::new(intent_proof, intent_message),
+            forfeit_psbts,
+            refresh_cosigner_pk: cosigner_kp.public_key(),
+        };
+
+        let txid = self
+            .rt
+            .block_on(client.refresh_escrow(refresh, cosigner_kp))
+            .map_err(to_magnus_err)?;
+
+        Ok(txid.to_string())
+    }
+
     /// Execute delegate settlement. Blocks until the batch ceremony completes.
+    ///
+    /// Deprecated: use `refresh_escrow` for recoverable escrow VTXOs, then the
+    /// normal offchain release/refund flow.
     ///
     /// Takes the fully-signed delegate PSBTs and runs the Arkade batch.
     /// Returns the commitment transaction ID (hex string).
+    #[allow(deprecated)]
     fn settle_delegate(
         &self,
         intent_proof_b64: String,
@@ -422,6 +552,9 @@ impl RbClient {
         forfeit_psbts_b64: Vec<String>,
         cosigner_sk_hex: String,
     ) -> Result<String, Error> {
+        warn_deprecated(
+            "ArkEscrow: settle_delegate is deprecated; use refresh_escrow for recoverable escrow VTXOs",
+        );
         let client = self.inner.lock().map_err(to_magnus_err)?;
 
         let intent_proof = psbt_from_base64(&intent_proof_b64)?;
@@ -581,9 +714,28 @@ fn rb_sign_checkpoint(psbt_b64: String, secret_key_hex: String) -> Result<String
     Ok(psbt_to_base64(&psbt))
 }
 
+/// Sign refresh PSBTs (intent + forfeits) with a single keypair.
+/// Takes and returns: (intent_proof_b64, forfeit_psbts_b64[])
+fn rb_sign_refresh(
+    intent_proof_b64: String,
+    forfeit_psbts_b64: Vec<String>,
+    secret_key_hex: String,
+) -> Result<(String, Vec<String>), Error> {
+    sign_intent_and_forfeits(intent_proof_b64, forfeit_psbts_b64, secret_key_hex)
+}
+
 /// Sign delegate PSBTs (intent + forfeits) with a single keypair.
 /// Takes and returns: (intent_proof_b64, forfeit_psbts_b64[])
 fn rb_sign_delegate(
+    intent_proof_b64: String,
+    forfeit_psbts_b64: Vec<String>,
+    secret_key_hex: String,
+) -> Result<(String, Vec<String>), Error> {
+    warn_deprecated("ArkEscrow: sign_delegate is deprecated; use sign_refresh");
+    sign_intent_and_forfeits(intent_proof_b64, forfeit_psbts_b64, secret_key_hex)
+}
+
+fn sign_intent_and_forfeits(
     intent_proof_b64: String,
     forfeit_psbts_b64: Vec<String>,
     secret_key_hex: String,
@@ -663,6 +815,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         method!(RbClient::unilateral_exit_delay, 0),
     )?;
     client_class.define_method("find_escrow_vtxo", method!(RbClient::find_escrow_vtxo, 1))?;
+    client_class.define_method(
+        "find_refresh_vtxos",
+        method!(RbClient::find_refresh_vtxos, 1),
+    )?;
     client_class.define_method("find_escrow_vtxos", method!(RbClient::find_escrow_vtxos, 1))?;
     client_class.define_method(
         "get_escrow_vtxo_status",
@@ -675,6 +831,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "spend_escrow_offchain",
         method!(RbClient::spend_escrow_offchain, 4),
     )?;
+    client_class.define_method("prepare_refresh", method!(RbClient::prepare_refresh, 4))?;
+    client_class.define_method("refresh_escrow", method!(RbClient::refresh_escrow, 4))?;
     client_class.define_method(
         "prepare_release_delegate",
         method!(RbClient::prepare_release_delegate, 5),
@@ -684,6 +842,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_module_function("sign_ark_tx", function!(rb_sign_ark_tx, 2))?;
     module.define_module_function("sign_checkpoint", function!(rb_sign_checkpoint, 2))?;
     module.define_module_function("merge_sigs", function!(rb_merge_sigs, 2))?;
+    module.define_module_function("sign_refresh", function!(rb_sign_refresh, 3))?;
     module.define_module_function("sign_delegate", function!(rb_sign_delegate, 3))?;
 
     Ok(())

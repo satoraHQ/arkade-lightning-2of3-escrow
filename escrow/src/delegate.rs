@@ -1,4 +1,9 @@
-//! Delegate settlement for escrow VTXOs.
+//! Legacy delegate settlement for escrow VTXOs.
+//!
+//! New code should use [`crate::refresh`] instead. Direct delegated release can
+//! fail when fee/referral outputs are below Arkade's dust threshold. The
+//! recommended flow is to refresh recoverable escrow VTXOs back into the same
+//! escrow contract, then perform the normal offchain release/refund.
 //!
 //! When escrow VTXOs become recoverable (expired, swept, or dust), the normal
 //! offchain spend path no longer works. Instead, the escrow can be settled via
@@ -36,6 +41,7 @@ use crate::{FeeOutput, ReleaseMode, plan_release};
 /// Unlike [`crate::spend::EscrowVtxo`] (which only needs outpoint + amount for
 /// offchain spends), delegate settlement also needs to know whether the VTXO
 /// has been swept (sub-dust VTXOs skip forfeits).
+#[deprecated(note = "use refresh::RefreshVtxo")]
 pub struct DelegateVtxo {
     pub outpoint: OutPoint,
     pub amount: Amount,
@@ -50,6 +56,10 @@ pub struct DelegateVtxo {
 ///
 /// The returned PSBTs are unsigned — callers sign with both the arbiter key and
 /// Bob's key before handing off to the delegate cosigner for batch execution.
+#[allow(deprecated)]
+#[deprecated(
+    note = "direct delegated release is legacy; use refresh::prepare_refresh(..., RefreshPath::Release) followed by normal offchain release"
+)]
 pub fn prepare_release_delegate(
     contract: &EscrowContract,
     vtxos: &[DelegateVtxo],
@@ -112,6 +122,7 @@ pub fn prepare_release_delegate(
 ///
 /// This is used by both the arbiter and Bob/Alice to add their escrow-leaf
 /// signature to the delegate PSBTs.
+#[deprecated(note = "use refresh::sign_refresh")]
 pub fn sign_delegate(delegate: &mut Delegate, keypair: &Keypair) -> Result<()> {
     let secp = Secp256k1::new();
     let xonly = keypair.x_only_public_key().0;
@@ -138,6 +149,7 @@ pub fn sign_delegate(delegate: &mut Delegate, keypair: &Keypair) -> Result<()> {
 ///
 /// Blocks until the batch ceremony completes (~10-30s). Returns the
 /// commitment transaction ID.
+#[deprecated(note = "use refresh::execute_refresh or EscrowClient::refresh_escrow")]
 pub async fn settle_delegate<R: Rng + CryptoRng>(
     grpc: &ark_grpc::Client,
     server_info: &server::Info,
@@ -435,6 +447,7 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
     }
 }
 
+#[allow(deprecated)]
 fn build_intent_inputs(
     vtxos: &[DelegateVtxo],
     spend_script: &ScriptBuf,

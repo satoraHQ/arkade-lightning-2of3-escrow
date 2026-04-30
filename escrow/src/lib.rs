@@ -4,6 +4,7 @@ use bitcoin::Amount;
 pub mod client;
 pub mod contract;
 pub mod delegate;
+pub mod refresh;
 pub mod spend;
 pub mod spend_store;
 
