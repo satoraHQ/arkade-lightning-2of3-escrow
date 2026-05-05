@@ -23,7 +23,7 @@ pub enum ReleaseMode {
 #[derive(Clone, Debug)]
 pub struct ReleasePlan {
     pub total_escrow_amount: Amount,
-    pub bob_amount: Amount,
+    pub buyer_amount: Amount,
     pub effective_fee_outputs: Vec<FeeOutput>,
     pub discarded_fee_outputs: Vec<FeeOutput>,
 }
@@ -40,13 +40,13 @@ pub fn plan_release(
     };
 
     let total_fee: Amount = effective_fee_outputs.iter().map(|o| o.amount).sum();
-    let bob_amount = total_escrow_amount.checked_sub(total_fee).with_context(|| {
+    let buyer_amount = total_escrow_amount.checked_sub(total_fee).with_context(|| {
         format!("fee exceeds amount locked up in escrow contract: {total_fee} > {total_escrow_amount}")
     })?;
 
     Ok(ReleasePlan {
         total_escrow_amount,
-        bob_amount,
+        buyer_amount,
         effective_fee_outputs,
         discarded_fee_outputs,
     })

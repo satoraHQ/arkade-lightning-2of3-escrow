@@ -3,8 +3,8 @@
 //! Refreshing is the recovery path for escrow VTXOs that are no longer
 //! spendable via the normal offchain path. A refresh settles one or more
 //! recoverable escrow VTXOs into a single new VTXO at the same escrow address.
-//! Once that new VTXO is spendable, callers should use the normal offchain
-//! release/refund flow.
+//! Once that new VTXO is spendable, callers should use the normal
+//! offchain flow.
 
 use anyhow::{Context, Result};
 use ark_core::batch::{self, Delegate};
@@ -15,19 +15,7 @@ use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
 
-use crate::contract::EscrowContract;
-
-/// Business action that the refresh enables.
-///
-/// The refresh output is always sent back to the same escrow contract address;
-/// this enum selects which collaborative escrow leaf must be signed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefreshPath {
-    /// Refresh using the Bob + arbiter + server leaf, then release offchain.
-    Release,
-    /// Refresh using the Alice + arbiter + server leaf, then refund offchain.
-    Refund,
-}
+use crate::contract::{EscrowContract, SignerSet};
 
 /// Everything needed to describe an escrow VTXO for refresh.
 #[derive(Debug, Clone)]
@@ -40,7 +28,7 @@ pub struct RefreshVtxo {
 /// Prepared refresh intent and forfeit PSBTs.
 ///
 /// The intent proof and forfeit PSBTs must be signed by the selected escrow
-/// leaf parties (arbiter + Bob for release, arbiter + Alice for refund) before
+/// selected signer set before
 /// calling [`execute_refresh`] or [`crate::client::EscrowClient::refresh_escrow`].
 #[derive(Debug, Clone)]
 pub struct RefreshIntent {
@@ -71,20 +59,17 @@ impl RefreshIntent {
 ///
 /// The refresh consumes one or more recoverable escrow VTXOs and creates a
 /// single offchain output back to `contract.address()` for the full input sum.
-/// No release/refund destination or fee outputs are included here; callers
-/// should perform the normal offchain release/refund after the refreshed VTXO
+/// No final destination or fee outputs are included here; callers
+/// should perform the normal offchain signer-set spend after the refreshed VTXO
 /// becomes spendable.
 pub fn prepare_refresh(
     contract: &EscrowContract,
     vtxos: &[RefreshVtxo],
-    path: RefreshPath,
+    signer_set: SignerSet,
     refresh_cosigner_pk: secp256k1::PublicKey,
     server_info: &server::Info,
 ) -> Result<RefreshIntent> {
-    let spend_script = match path {
-        RefreshPath::Release => contract.options().bob_arbiter_script(),
-        RefreshPath::Refund => contract.options().alice_arbiter_script(),
-    };
+    let spend_script = signer_set.script(contract.options());
     let control_block = contract.control_block(&spend_script)?;
     let tapscripts = contract.tapscripts();
     let script_pubkey = contract.script_pubkey();

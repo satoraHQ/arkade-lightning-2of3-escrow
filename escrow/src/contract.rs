@@ -8,14 +8,16 @@ use std::str::FromStr;
 
 /// Configuration for a 2-of-3 escrow contract on Arkade.
 ///
-/// Any two of {alice, bob, arbiter} can spend. Collaborative paths include the
+/// Any two of {seller, buyer, arbiter} can spend. Collaborative paths include the
 /// Arkade server signature; unilateral paths use CSV delay instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscrowOptions {
-    /// Alice's public key (the party funding the escrow).
-    pub alice: XOnlyPublicKey,
-    /// Bob's public key (the party receiving bitcoin on release).
-    pub bob: XOnlyPublicKey,
+    /// Seller's public key (the party funding the escrow).
+    #[serde(alias = "alice")]
+    pub seller: XOnlyPublicKey,
+    /// Buyer's public key.
+    #[serde(alias = "bob")]
+    pub buyer: XOnlyPublicKey,
     /// Arbiter's public key.
     pub arbiter: XOnlyPublicKey,
     /// Arkade server's public key.
@@ -24,10 +26,28 @@ pub struct EscrowOptions {
     pub unilateral_exit_delay: bitcoin::Sequence,
 }
 
+/// Collaborative signer set used to spend an escrow VTXO with the Arkade server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignerSet {
+    BuyerArbiter,
+    SellerArbiter,
+    SellerBuyer,
+}
+
+impl SignerSet {
+    pub fn script(self, options: &EscrowOptions) -> ScriptBuf {
+        match self {
+            SignerSet::BuyerArbiter => options.buyer_arbiter_script(),
+            SignerSet::SellerArbiter => options.seller_arbiter_script(),
+            SignerSet::SellerBuyer => options.seller_buyer_script(),
+        }
+    }
+}
+
 impl EscrowOptions {
     /// Validate that all keys are distinct and the delay is non-zero.
     pub fn validate(&self) -> Result<()> {
-        let keys = [self.alice, self.bob, self.arbiter, self.server];
+        let keys = [self.seller, self.buyer, self.arbiter, self.server];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
                 if keys[i] == keys[j] {
@@ -46,36 +66,36 @@ impl EscrowOptions {
 
     // -- Collaborative leaves (include server_pk) --
 
-    /// Leaf 1: alice + arbiter + server — arbiter-assisted refund to Alice.
-    pub fn alice_arbiter_script(&self) -> ScriptBuf {
-        collaborative_3of3(self.alice, self.arbiter, self.server)
+    /// Leaf 1: seller + arbiter + server.
+    pub fn seller_arbiter_script(&self) -> ScriptBuf {
+        collaborative_3of3(self.seller, self.arbiter, self.server)
     }
 
-    /// Leaf 2: bob + arbiter + server — arbiter-assisted release to Bob (happy path).
-    pub fn bob_arbiter_script(&self) -> ScriptBuf {
-        collaborative_3of3(self.bob, self.arbiter, self.server)
+    /// Leaf 2: buyer + arbiter + server.
+    pub fn buyer_arbiter_script(&self) -> ScriptBuf {
+        collaborative_3of3(self.buyer, self.arbiter, self.server)
     }
 
-    /// Leaf 3: alice + bob + server — mutual settlement, no arbiter needed.
-    pub fn alice_bob_script(&self) -> ScriptBuf {
-        collaborative_3of3(self.alice, self.bob, self.server)
+    /// Leaf 3: seller + buyer + server — mutual settlement, no arbiter needed.
+    pub fn seller_buyer_script(&self) -> ScriptBuf {
+        collaborative_3of3(self.seller, self.buyer, self.server)
     }
 
     // -- Unilateral leaves (CSV delay, no server) --
 
-    /// Leaf 4: CSV + alice + arbiter — unilateral refund.
-    pub fn unilateral_alice_arbiter_script(&self) -> ScriptBuf {
-        unilateral_2of2(self.unilateral_exit_delay, self.alice, self.arbiter)
+    /// Leaf 4: CSV + seller + arbiter.
+    pub fn unilateral_seller_arbiter_script(&self) -> ScriptBuf {
+        unilateral_2of2(self.unilateral_exit_delay, self.seller, self.arbiter)
     }
 
-    /// Leaf 5: CSV + bob + arbiter — unilateral release.
-    pub fn unilateral_bob_arbiter_script(&self) -> ScriptBuf {
-        unilateral_2of2(self.unilateral_exit_delay, self.bob, self.arbiter)
+    /// Leaf 5: CSV + buyer + arbiter.
+    pub fn unilateral_buyer_arbiter_script(&self) -> ScriptBuf {
+        unilateral_2of2(self.unilateral_exit_delay, self.buyer, self.arbiter)
     }
 
-    /// Leaf 6: CSV + alice + bob — unilateral mutual settlement.
-    pub fn unilateral_alice_bob_script(&self) -> ScriptBuf {
-        unilateral_2of2(self.unilateral_exit_delay, self.alice, self.bob)
+    /// Leaf 6: CSV + seller + buyer — unilateral mutual settlement.
+    pub fn unilateral_seller_buyer_script(&self) -> ScriptBuf {
+        unilateral_2of2(self.unilateral_exit_delay, self.seller, self.buyer)
     }
 }
 
@@ -123,12 +143,12 @@ impl EscrowContract {
     /// All 6 tapscripts in tree order (collaborative then unilateral).
     pub fn tapscripts(&self) -> Vec<ScriptBuf> {
         vec![
-            self.options.alice_arbiter_script(),
-            self.options.bob_arbiter_script(),
-            self.options.alice_bob_script(),
-            self.options.unilateral_alice_arbiter_script(),
-            self.options.unilateral_bob_arbiter_script(),
-            self.options.unilateral_alice_bob_script(),
+            self.options.seller_arbiter_script(),
+            self.options.buyer_arbiter_script(),
+            self.options.seller_buyer_script(),
+            self.options.unilateral_seller_arbiter_script(),
+            self.options.unilateral_buyer_arbiter_script(),
+            self.options.unilateral_seller_buyer_script(),
         ]
     }
 
@@ -203,12 +223,12 @@ fn build_taproot(opts: &EscrowOptions) -> Result<TaprootSpendInfo> {
 
     // All leaves equal weight (balanced tree).
     let scripts = vec![
-        opts.alice_arbiter_script(),
-        opts.bob_arbiter_script(),
-        opts.alice_bob_script(),
-        opts.unilateral_alice_arbiter_script(),
-        opts.unilateral_bob_arbiter_script(),
-        opts.unilateral_alice_bob_script(),
+        opts.seller_arbiter_script(),
+        opts.buyer_arbiter_script(),
+        opts.seller_buyer_script(),
+        opts.unilateral_seller_arbiter_script(),
+        opts.unilateral_buyer_arbiter_script(),
+        opts.unilateral_seller_buyer_script(),
     ];
 
     let mut nodes: Vec<TreeNode> = scripts
@@ -261,14 +281,14 @@ mod tests {
     fn test_options() -> EscrowOptions {
         let secp = Secp256k1::new();
         let mut rng = bitcoin::secp256k1::rand::thread_rng();
-        let alice = Keypair::new(&secp, &mut rng).x_only_public_key().0;
-        let bob = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+        let seller = Keypair::new(&secp, &mut rng).x_only_public_key().0;
+        let buyer = Keypair::new(&secp, &mut rng).x_only_public_key().0;
         let arbiter = Keypair::new(&secp, &mut rng).x_only_public_key().0;
         let server = Keypair::new(&secp, &mut rng).x_only_public_key().0;
 
         EscrowOptions {
-            alice,
-            bob,
+            seller,
+            buyer,
             arbiter,
             server,
             unilateral_exit_delay: bitcoin::Sequence(512),
@@ -307,8 +327,8 @@ mod tests {
         let other = Keypair::new(&secp, &mut rng).x_only_public_key().0;
 
         let opts = EscrowOptions {
-            alice: k,
-            bob: k,
+            seller: k,
+            buyer: k,
             arbiter: other,
             server: Keypair::new(&secp, &mut rng).x_only_public_key().0,
             unilateral_exit_delay: bitcoin::Sequence(512),
@@ -322,8 +342,8 @@ mod tests {
         let mut rng = bitcoin::secp256k1::rand::thread_rng();
 
         let opts = EscrowOptions {
-            alice: Keypair::new(&secp, &mut rng).x_only_public_key().0,
-            bob: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            seller: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            buyer: Keypair::new(&secp, &mut rng).x_only_public_key().0,
             arbiter: Keypair::new(&secp, &mut rng).x_only_public_key().0,
             server: Keypair::new(&secp, &mut rng).x_only_public_key().0,
             unilateral_exit_delay: bitcoin::Sequence(0),

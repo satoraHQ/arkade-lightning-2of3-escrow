@@ -159,9 +159,9 @@ impl EscrowClient {
     /// Execute a delegate settlement via the Arkade batch ceremony.
     ///
     /// Deprecated: use [`EscrowClient::refresh_escrow`] for recoverable escrow
-    /// VTXOs, then perform the normal offchain release/refund flow.
+    /// VTXOs, then perform the normal offchain flow.
     #[deprecated(
-        note = "direct delegate settlement is legacy; use refresh_escrow followed by normal offchain release/refund"
+        note = "direct delegate settlement is legacy; use refresh_escrow followed by normal offchain spend"
     )]
     pub async fn settle_delegate(&self, delegate: Delegate, cosigner_kp: Keypair) -> Result<Txid> {
         let info = self.server_info()?;
@@ -193,7 +193,7 @@ impl EscrowClient {
     ///   status until Arkade exposes that status explicitly for escrow VTXOs.
     /// - `id` — application-level identifier for deduplication (e.g. trade ID).
     /// - `merged_ark_tx` — the ark_tx PSBT with all non-server signatures
-    ///   already merged (e.g. arbiter + bob, or arbiter + alice for a refund).
+    ///   already merged (e.g. arbiter + buyer, or arbiter + seller).
     /// - `unsigned_checkpoints` — the raw unsigned checkpoint PSBTs (sent to
     ///   Arkade during submit so the server never sees party checkpoint sigs
     ///   before co-signing the ark_tx).

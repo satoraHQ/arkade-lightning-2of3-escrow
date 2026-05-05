@@ -5,7 +5,7 @@ use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 
-use crate::contract::EscrowContract;
+use crate::contract::{EscrowContract, SignerSet};
 use crate::{FeeOutput, ReleaseMode, plan_release};
 
 /// Everything needed to describe an escrow VTXO that will be spent.
@@ -16,7 +16,7 @@ pub struct EscrowVtxo {
     pub amount: Amount,
 }
 
-/// The result of building an escrow spend transaction (release or refund).
+/// The result of building an escrow spend transaction.
 ///
 /// Contains the ark_tx PSBT (needs signer + server sigs) and the checkpoint
 /// PSBTs that will be signed after server co-signs.
@@ -27,21 +27,22 @@ pub struct EscrowTransaction {
 
 /// Build the offchain release transaction.
 ///
-/// Produces an ark_tx spending the escrow VTXO via the `bob_arbiter` leaf
-/// (collaborative path: bob + arbiter + server). Outputs go to:
-///   - Bob's destination address (escrow amount minus fee)
+/// Produces an ark_tx spending the escrow VTXO.
+/// Outputs go to:
+///   - Buyer's destination address (escrow amount minus fee)
 ///   - Arbiter's fee address (if fee > 0)
 ///
-/// The returned PSBTs are unsigned — callers collect signatures from Bob and
-/// the arbiter before submitting.
+/// The returned PSBTs are unsigned — callers collect signatures from
+/// signing parties before submitting.
 pub fn build_release_tx(
     contract: &EscrowContract,
     escrow_vtxo: &EscrowVtxo,
-    bob_dest: &ark_core::ArkAddress,
+    buyer_dest: &ark_core::ArkAddress,
     fee_outputs: &[FeeOutput],
+    signer_set: SignerSet,
     server_info: &server::Info,
 ) -> Result<EscrowTransaction> {
-    let spend_script = contract.options().bob_arbiter_script();
+    let spend_script = signer_set.script(contract.options());
     let control_block = contract.control_block(&spend_script)?;
 
     let vtxo_input = VtxoInput::new(
@@ -62,7 +63,7 @@ pub fn build_release_tx(
     )?;
 
     let mut outputs: Vec<(&ark_core::ArkAddress, Amount)> = Vec::new();
-    outputs.push((bob_dest, release_plan.bob_amount));
+    outputs.push((buyer_dest, release_plan.buyer_amount));
 
     for fee_output in &release_plan.effective_fee_outputs {
         outputs.push((&fee_output.address, fee_output.amount));
@@ -85,16 +86,17 @@ pub fn build_release_tx(
     })
 }
 
-/// Build a refund transaction (alice + arbiter path).
+/// Build the offchain refund transaction.
 ///
-/// Returns the full escrow amount to Alice (no fee output).
+/// Returns the full escrow amount to the seller destination (no fee output).
 pub fn build_refund_tx(
     contract: &EscrowContract,
     escrow_vtxo: &EscrowVtxo,
-    alice_dest: &ark_core::ArkAddress,
+    seller_dest: &ark_core::ArkAddress,
+    signer_set: SignerSet,
     server_info: &server::Info,
 ) -> Result<EscrowTransaction> {
-    let spend_script = contract.options().alice_arbiter_script();
+    let spend_script = signer_set.script(contract.options());
     let control_block = contract.control_block(&spend_script)?;
 
     let vtxo_input = VtxoInput::new(
@@ -107,7 +109,7 @@ pub fn build_refund_tx(
         escrow_vtxo.outpoint,
     );
 
-    let outputs = [(alice_dest, escrow_vtxo.amount)];
+    let outputs = [(seller_dest, escrow_vtxo.amount)];
 
     let OffchainTransactions {
         ark_tx,
@@ -128,7 +130,7 @@ pub fn build_refund_tx(
 
 // --- Signing helpers ---
 
-/// Sign the ark_tx PSBT with a single keypair (Bob or arbiter).
+/// Sign the ark_tx PSBT with a single escrow signer keypair.
 ///
 /// Adds a tapscript signature for the given key on input 0 (the escrow VTXO).
 pub fn sign_ark_tx(psbt: &mut Psbt, keypair: &Keypair) -> Result<()> {

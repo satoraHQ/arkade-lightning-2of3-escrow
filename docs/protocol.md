@@ -1,49 +1,49 @@
 # Escrow PSBT Exchange Protocol
 
-This document describes the signing protocol for releasing or refunding an escrow VTXO on Arkade.
+This document describes the signing protocol for spending an escrow VTXO on Arkade using named signer sets.
 
 ## Parties
 
 | Party | Role |
 |-------|------|
-| **Alice** | Escrow funder (buyer) |
-| **Bob** | Escrow recipient (seller) |
+| **Seller** | Escrow funder |
+| **Buyer** | Escrow recipient |
 | **Arbiter** | Trusted mediator (e.g. platform operator) |
 | **Arkade Server** | Co-signer for collaborative paths |
 
 ## Contract Setup
 
-1. Alice and Bob exchange public keys
+1. Seller and Buyer exchange public keys
 2. The arbiter provides its public key
 3. An `EscrowContract` is created with all 4 public keys + CSV delay
-4. Alice funds the resulting Arkade address (the escrow VTXO)
+4. Seller funds the resulting Arkade address (the escrow VTXO)
 
-## Release Flow (Happy Path)
+## Buyer + Arbiter Flow
 
-The release uses the **Bob + Arbiter + Server** collaborative leaf.
+This flow uses the **Buyer + Arbiter + Server** collaborative leaf.
 
-The client (Bob) signs all PSBTs in a **single round-trip**. PSBT
-`tap_script_sigs` are independent per-key, so Bob's and the arbiter's
+The client (Buyer) signs all PSBTs in a **single round-trip**. PSBT
+`tap_script_sigs` are independent per-key, so Buyer's and the arbiter's
 signatures can be collected before the Arkade server sees the checkpoints.
 
 ```
 ┌─────────┐     ┌──────────┐     ┌────────┐
-│  Bob    │     │ Arbiter  │     │ Arkade │
+│  Buyer    │     │ Arbiter  │     │ Arkade │
 │(browser)│     │(backend) │     │ (gRPC) │
 └────┬────┘     └────┬─────┘     └───┬────┘
      │               │               │
-     │  1. Request release            │
+     │  1. Request buyer+arbiter spend│
      │──────────────>│               │
      │               │               │
-     │               │ 2. build_release_tx()
+     │               │ 2. build_release_tx(..., signer_set)
      │               │ 3. sign_ark_tx(arbiter_sk)
      │               │ 4. sign_checkpoint(arbiter_sk) × N
      │               │               │
      │  5. All arbiter-signed PSBTs  │
      │<──────────────│               │
      │               │               │
-     │ 6. sign_ark_tx(bob_sk)        │
-     │ 7. sign_checkpoints(bob_sk)   │
+     │ 6. sign_ark_tx(buyer_sk)        │
+     │ 7. sign_checkpoints(buyer_sk)   │
      │ 8. Return all signed PSBTs    │
      │──────────────>│               │
      │               │               │
@@ -55,59 +55,59 @@ signatures can be collected before the Arkade server sees the checkpoints.
      │               │<─────────────────────────────│
      │               │               │
      │               │ 12. merge arbiter cp sigs into server cps
-     │               │ 13. merge bob cp sigs into server cps
+     │               │ 13. merge buyer cp sigs into server cps
      │               │ 14. finalize(txid, fully-signed cps)
      │               │──────────────────────────────>│
      │               │               │
-     │  15. Done — escrow released   │
+     │  15. Done — escrow spent      │
      │<──────────────│               │
 ```
 
 ### Step-by-step
 
-1. **Bob requests release** — provides his destination Arkade address
-2. **Arbiter builds the release tx** — `build_release_tx()` produces unsigned `ark_tx` + `checkpoint_txs` PSBTs
+1. **Buyer requests a buyer + arbiter spend** — provides their destination Arkade address
+2. **Arbiter builds the transaction** — `build_release_tx(..., signer_set)` produces unsigned `ark_tx` + `checkpoint_txs` PSBTs
 3. **Arbiter signs ark_tx** — `sign_ark_tx(ark_tx, arbiter_sk)`
 4. **Arbiter signs checkpoints** — `sign_checkpoint(cp, arbiter_sk)` for each
 5. **Arbiter returns all PSBTs** — arbiter-signed `ark_tx` + arbiter-signed checkpoints
-6. **Bob signs ark_tx** — `sign_ark_tx(ark_tx, bob_sk)` or TS equivalent
-7. **Bob signs checkpoints** — `sign_checkpoint(cp, bob_sk)` for each
-8. **Bob returns all signed PSBTs** to the arbiter
-9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, bob_signed)`
+6. **Buyer signs ark_tx** — `sign_ark_tx(ark_tx, buyer_sk)` or TS equivalent
+7. **Buyer signs checkpoints** — `sign_checkpoint(cp, buyer_sk)` for each
+8. **Buyer returns all signed PSBTs** to the arbiter
+9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, buyer_signed)`
 10. **Arbiter submits to Arkade** — `submit(merged_ark_tx, UNSIGNED_checkpoints)` via gRPC. **Only unsigned checkpoints are sent** — checkpoint signatures must not be revealed to the server before it co-signs the ark_tx.
 11. **Arkade returns server-signed checkpoints** — server adds its signatures to the checkpoints
 12. **Arbiter merges its checkpoint sigs** into the server-signed copies
-13. **Arbiter merges Bob's checkpoint sigs** into the result
+13. **Arbiter merges Buyer's checkpoint sigs** into the result
 14. **Arbiter finalizes** — `finalize(ark_txid, fully_signed_checkpoints)` via gRPC
-15. **Done** — escrow VTXO is spent, Bob receives funds at destination
+15. **Done** — escrow VTXO is spent, buyer receives funds at destination
 
 ### Security invariant
 
-> Checkpoint signatures (arbiter's and Bob's) are **never** sent to the
+> Checkpoint signatures (arbiter's and Buyer's) are **never** sent to the
 > Arkade server before the server co-signs the ark_tx. The `submit` call
 > only includes unsigned checkpoints. This prevents the server from
 > broadcasting checkpoints unilaterally before committing to the ark
 > transaction.
 
-## Refund Flow
+## Seller + Arbiter Flow
 
-Same protocol but uses the **Alice + Arbiter + Server** collaborative leaf via `build_refund_tx()`. Alice signs instead of Bob, and funds return to Alice's address.
+Same protocol, but uses the **Seller + Arbiter + Server** collaborative leaf via `build_refund_tx(..., signer_set)`. Seller signs instead of buyer, and funds go to the seller destination.
 
 ## Refresh Flow for Recoverable VTXOs
 
-If the escrow VTXO is recoverable rather than spendable, do not release/refund it directly via settlement. Settlement cannot create sub-dust outputs, while release may include small platform/referral fee outputs.
+If the escrow VTXO is recoverable rather than spendable, refresh it instead of using direct settlement. Settlement cannot create sub-dust outputs, while the buyer + arbiter flow may include small platform/referral fee outputs.
 
 Instead, first **refresh** the escrow contract:
 
-1. Arbiter calls `prepare_refresh(contract, vtxos, RefreshPath::Release, ...)` for release, or `RefreshPath::Refund` for refund.
+1. Arbiter calls `prepare_refresh(contract, vtxos, signer_set, ...)` with `SignerSet::BuyerArbiter`, `SignerSet::SellerArbiter`, or `SignerSet::SellerBuyer`.
 2. The refresh intent creates a single output back to the same escrow address for the full input sum.
-3. Bob signs the refresh for release; Alice signs it for refund. The arbiter also signs.
+3. The parties in the selected signer set sign the refresh.
 4. Arbiter calls `refresh_escrow(...)`.
-5. Once the refreshed escrow VTXO is visible/spendable, run the normal release/refund flow above.
+5. Once the refreshed escrow VTXO is visible/spendable, run the normal offchain signer-set flow above.
 
-This means recoverable release/refund requires two signing rounds: one refresh round, then one normal offchain release/refund round.
+This means recoverable spends require two signing rounds: one refresh round, then one normal offchain spend round.
 
-Legacy direct delegated release APIs remain available for compatibility, but are deprecated.
+Legacy direct delegated buyer + arbiter APIs remain available for compatibility, but are deprecated.
 
 ## Unilateral Exit
 
@@ -136,7 +136,7 @@ const { signedPsbt, txid } = signEscrowArkTx(arkTxPsbtB64, secretKey);
 const signedCheckpoints = signEscrowCheckpoints(checkpointPsbtB64s, secretKey);
 
 // Send both back to the arbiter
-await api("POST", `/release/sign`, {
+await api("POST", `/buyer-arbiter/sign`, {
   signed_ark_tx: signedPsbt,
   signed_checkpoints: signedCheckpoints,
 });

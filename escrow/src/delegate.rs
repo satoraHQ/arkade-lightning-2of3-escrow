@@ -1,9 +1,9 @@
 //! Legacy delegate settlement for escrow VTXOs.
 //!
-//! New code should use [`crate::refresh`] instead. Direct delegated release can
-//! fail when fee/referral outputs are below Arkade's dust threshold. The
-//! recommended flow is to refresh recoverable escrow VTXOs back into the same
-//! escrow contract, then perform the normal offchain release/refund.
+//! New code should use [`crate::refresh`] instead. Direct delegated buyer +
+//! arbiter settlement can fail when fee/referral outputs are below Arkade's dust
+//! threshold. The recommended flow is to refresh recoverable escrow VTXOs back
+//! into the same escrow contract, then perform the normal offchain signer-set spend.
 //!
 //! When escrow VTXOs become recoverable (expired, swept, or dust), the normal
 //! offchain spend path no longer works. Instead, the escrow can be settled via
@@ -11,7 +11,7 @@
 //!
 //! 1. The arbiter prepares unsigned delegate PSBTs (intent + forfeits).
 //! 2. The arbiter signs them with the arbiter key (escrow leaf signer).
-//! 3. Bob (or Alice for refund) signs them with their key.
+//! 3. Buyer signs them with their key.
 //! 4. The arbiter's server cosigns as delegate cosigner and runs the batch.
 //!
 //! This module provides helpers for preparing, signing, and executing delegate
@@ -48,27 +48,27 @@ pub struct DelegateVtxo {
     pub is_swept: bool,
 }
 
-/// Prepare unsigned delegate PSBTs for an escrow release (bob + arbiter path).
+/// Prepare unsigned delegate PSBTs for the buyer + arbiter path.
 ///
 /// Returns a [`Delegate`] struct containing:
-/// - An intent proof PSBT committing to Bob's destination output.
+/// - An intent proof PSBT committing to Buyer's destination output.
 /// - Forfeit PSBTs (one per non-swept, non-dust VTXO) with SIGHASH_ALL|ANYONECANPAY.
 ///
 /// The returned PSBTs are unsigned — callers sign with both the arbiter key and
-/// Bob's key before handing off to the delegate cosigner for batch execution.
+/// Buyer's key before handing off to the delegate cosigner for batch execution.
 #[allow(deprecated)]
 #[deprecated(
-    note = "direct delegated release is legacy; use refresh::prepare_refresh(..., RefreshPath::Release) followed by normal offchain release"
+    note = "direct delegated buyer + arbiter settlement is legacy; use refresh::prepare_refresh(..., SignerSet::BuyerArbiter) followed by normal offchain spend"
 )]
-pub fn prepare_release_delegate(
+pub fn prepare_buyer_arbiter_delegate(
     contract: &EscrowContract,
     vtxos: &[DelegateVtxo],
-    bob_dest: &ark_core::ArkAddress,
+    buyer_dest: &ark_core::ArkAddress,
     fee_outputs: &[FeeOutput],
     delegate_cosigner_pk: secp256k1::PublicKey,
     server_info: &server::Info,
 ) -> Result<Delegate> {
-    let spend_script = contract.options().bob_arbiter_script();
+    let spend_script = contract.options().buyer_arbiter_script();
     let control_block = contract.control_block(&spend_script)?;
     let tapscripts = contract.tapscripts();
     let script_pubkey = contract.script_pubkey();
@@ -94,8 +94,8 @@ pub fn prepare_release_delegate(
     }
 
     let mut outputs = vec![intent::Output::Offchain(bitcoin::TxOut {
-        script_pubkey: bob_dest.to_p2tr_script_pubkey(),
-        value: release_plan.bob_amount,
+        script_pubkey: buyer_dest.to_p2tr_script_pubkey(),
+        value: release_plan.buyer_amount,
     })];
 
     for fee_output in &release_plan.effective_fee_outputs {
@@ -120,7 +120,7 @@ pub fn prepare_release_delegate(
 
 /// Sign the delegate PSBTs (intent + forfeits) with a single keypair.
 ///
-/// This is used by both the arbiter and Bob/Alice to add their escrow-leaf
+/// This is used by the escrow leaf signers to add their escrow-leaf
 /// signature to the delegate PSBTs.
 #[deprecated(note = "use refresh::sign_refresh")]
 pub fn sign_delegate(delegate: &mut Delegate, keypair: &Keypair) -> Result<()> {

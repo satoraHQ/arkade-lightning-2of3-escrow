@@ -9,14 +9,14 @@ This SDK provides primitives for building escrow applications where any two of t
 ### Taproot contract (6 leaves)
 
 **Collaborative paths** (include Arkade server signature):
-- Alice + Arbiter + Server — arbiter-assisted refund
-- Bob + Arbiter + Server — arbiter-assisted release (happy path)
-- Alice + Bob + Server — mutual settlement
+- Seller + Arbiter + Server
+- Buyer + Arbiter + Server
+- Seller + Buyer + Server — mutual settlement
 
 **Unilateral paths** (CSV delay, no server needed):
-- CSV + Alice + Arbiter — unilateral refund
-- CSV + Bob + Arbiter — unilateral release
-- CSV + Alice + Bob — unilateral mutual settlement
+- CSV + Seller + Arbiter
+- CSV + Buyer + Arbiter
+- CSV + Seller + Buyer — unilateral mutual settlement
 
 ## Rust crate (`ark-escrow`)
 
@@ -29,7 +29,8 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 
 - **`EscrowContract`** — builds the taproot tree from 4 public keys + CSV delay
 - **`EscrowClient`** — wraps Arkade gRPC (connect, find VTXOs, offchain spend with crash recovery, escrow refresh)
-- **`build_release_tx`** / **`build_refund_tx`** — construct unsigned offchain release/refund PSBTs
+- **`SignerSet`** — selects which collaborative leaf signs (`BuyerArbiter`, `SellerArbiter`, or `SellerBuyer`)
+- **`build_release_tx`** / **`build_refund_tx`** — construct unsigned offchain PSBTs; callers choose the signer set
 - **`prepare_refresh`** — construct unsigned refresh PSBTs for recoverable VTXOs
 - **`plan_release`** — compute effective payout and fee outputs without building PSBTs
 - **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_refresh`** — Schnorr signing helpers
@@ -41,14 +42,14 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 ```rust
 use ark_escrow::{
     FeeOutput,
-    contract::{EscrowContract, EscrowOptions},
+    contract::{EscrowContract, EscrowOptions, SignerSet},
     client::EscrowClient,
     spend,
 };
 
 // 1. Create contract
 let contract = EscrowContract::new(EscrowOptions {
-    alice, bob, arbiter, server,
+    seller, buyer, arbiter, server,
     unilateral_exit_delay: bitcoin::Sequence::from_height(144),
 }, Network::Bitcoin)?;
 
@@ -58,16 +59,21 @@ let info = client.connect().await?;
 let vtxo = client.find_escrow_vtxo(&contract).await?
     .expect("escrow VTXO not found");
 
-// 3. Build release transaction (with fee outputs)
+// 3. Build release transaction (with fee outputs and chosen signer set)
 let fee_outputs = vec![
     FeeOutput { address: fee_addr, amount: Amount::from_sat(100) },
 ];
 let release = spend::build_release_tx(
-    &contract, &vtxo, &bob_addr, &fee_outputs, info,
+    &contract,
+    &vtxo,
+    &buyer_addr,
+    &fee_outputs,
+    SignerSet::BuyerArbiter,
+    info,
 )?;
 
 // 4. Sign (each party signs independently)
-spend::sign_ark_tx(&mut release.ark_tx, &bob_keypair)?;
+spend::sign_ark_tx(&mut release.ark_tx, &buyer_keypair)?;
 spend::sign_ark_tx(&mut arbiter_copy, &arbiter_keypair)?;
 spend::merge_ark_tx_sigs(&mut release.ark_tx, &arbiter_copy)?;
 
@@ -100,17 +106,17 @@ client.connect
 
 # Create contract
 contract = ArkEscrow::Contract.new(
-  alice_pk, bob_pk, arbiter_pk, client.server_pk,
+  seller_pk, buyer_pk, arbiter_pk, client.server_pk,
   client.unilateral_exit_delay, "bitcoin"
 )
 
 # Find funded VTXO
 outpoint, amount = client.find_escrow_vtxo(contract)
 
-# Build release (with fee outputs as [address, sats] pairs)
+# Build buyer + arbiter spend (with fee outputs as [address, sats] pairs)
 fee_outputs = [["ark1...fee", 100]]
 ark_tx_b64, checkpoint_b64s = client.build_release(
-  contract, outpoint, amount, bob_dest_address, fee_outputs
+  contract, outpoint, amount, buyer_dest_address, fee_outputs, "buyer_arbiter"
 )
 
 # Sign and merge
@@ -119,31 +125,31 @@ merged = ArkEscrow.merge_sigs(signed, other_signed)
 
 # Finalize with crash recovery
 ark_txid = client.spend_escrow_offchain(
-  trade_id, merged, unsigned_checkpoints, [arbiter_cps, bob_cps]
+  trade_id, merged, unsigned_checkpoints, [arbiter_cps, buyer_cps]
 )
 ```
 
 ### Refreshing recoverable VTXOs
 
-When escrow VTXOs become recoverable, first refresh them back into the same escrow contract address. The refreshed escrow then becomes spendable again and should be released/refunded using the normal offchain flow. This avoids direct settlement outputs for fees/referrals, which may be sub-dust.
+When escrow VTXOs become recoverable, first refresh them back into the same escrow contract address. The refreshed escrow then becomes spendable again through the normal offchain signer-set flow. This avoids direct settlement outputs for fees/referrals, which may be sub-dust.
 
 ```ruby
 # Check VTXO status
 pending, vtxos, any_recoverable = client.get_escrow_vtxo_status(trade_id, contract)
 
-# Prepare + sign + refresh for release. Use "refund" for refund flows.
+# Prepare + sign + refresh using the selected signer set.
 intent_b64, message_json, forfeit_b64s, cosigner_pk =
-  client.prepare_refresh(contract, vtxos, "release", cosigner_sk)
+  client.prepare_refresh(contract, vtxos, "buyer_arbiter", cosigner_sk)
 
-signed_intent, signed_forfeits = ArkEscrow.sign_refresh(intent_b64, forfeit_b64s, bob_sk)
-# ... merge arbiter + bob sigs, then:
+signed_intent, signed_forfeits = ArkEscrow.sign_refresh(intent_b64, forfeit_b64s, buyer_sk)
+# ... merge arbiter + buyer sigs, then:
 txid = client.refresh_escrow(signed_intent, message_json, signed_forfeits, cosigner_sk)
 
 # Once the refreshed VTXO is visible/spendable, use build_release/build_refund.
 outpoint, amount = client.find_escrow_vtxo(contract)
 ```
 
-Legacy direct delegated release methods remain for compatibility, but are deprecated.
+Legacy direct delegated methods remain for compatibility, but are deprecated.
 
 ### Rust logging
 

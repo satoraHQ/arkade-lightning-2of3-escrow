@@ -1,10 +1,8 @@
 use std::sync::Mutex;
 
 use ark_escrow::client::EscrowClient;
-use ark_escrow::contract::{EscrowContract, EscrowOptions};
-#[allow(deprecated)]
-use ark_escrow::delegate::{self, DelegateVtxo};
-use ark_escrow::refresh::{self, RefreshIntent, RefreshPath, RefreshVtxo};
+use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
+use ark_escrow::refresh::{self, RefreshIntent, RefreshVtxo};
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
@@ -72,12 +70,13 @@ fn psbt_from_base64(s: &str) -> Result<Psbt, Error> {
     Psbt::deserialize(&bytes).map_err(to_magnus_err)
 }
 
-fn parse_refresh_path(path: &str) -> Result<RefreshPath, Error> {
-    match path {
-        "release" => Ok(RefreshPath::Release),
-        "refund" => Ok(RefreshPath::Refund),
+fn parse_signer_set(signer_set: &str) -> Result<SignerSet, Error> {
+    match signer_set {
+        "buyer_arbiter" => Ok(SignerSet::BuyerArbiter),
+        "seller_arbiter" => Ok(SignerSet::SellerArbiter),
+        "seller_buyer" => Ok(SignerSet::SellerBuyer),
         _ => Err(to_magnus_err(format!(
-            "unknown refresh path: {path}; expected 'release' or 'refund'"
+            "unknown signer_set: {signer_set}; expected 'buyer_arbiter', 'seller_arbiter', or 'seller_buyer'"
         ))),
     }
 }
@@ -165,16 +164,16 @@ struct RbContract {
 
 impl RbContract {
     fn new(
-        alice_pk: String,
-        bob_pk: String,
+        seller_pk: String,
+        buyer_pk: String,
         arbiter_pk: String,
         server_pk: String,
         unilateral_exit_delay: u32,
         network: String,
     ) -> Result<Self, Error> {
         let opts = EscrowOptions {
-            alice: parse_xonly(&alice_pk)?,
-            bob: parse_xonly(&bob_pk)?,
+            seller: parse_xonly(&seller_pk)?,
+            buyer: parse_xonly(&buyer_pk)?,
             arbiter: parse_xonly(&arbiter_pk)?,
             server: parse_xonly(&server_pk)?,
             // Match Arkade's parse_sequence_number convention:
@@ -343,7 +342,7 @@ impl RbClient {
 
     /// Quote a release without building PSBTs.
     ///
-    /// Returns `[bob_amount_sats, effective_fee_outputs, discarded_fee_outputs]`
+    /// Returns `[buyer_amount_sats, effective_fee_outputs, discarded_fee_outputs]`
     /// where each fee-output array contains `[address, amount_sats]` tuples.
     #[allow(clippy::type_complexity)]
     fn quote_release(
@@ -384,7 +383,7 @@ impl RbClient {
             .collect();
 
         Ok((
-            release_plan.bob_amount.to_sat(),
+            release_plan.buyer_amount.to_sat(),
             effective_fee_outputs,
             discarded_fee_outputs,
         ))
@@ -397,7 +396,7 @@ impl RbClient {
         &self,
         contract: &RbContract,
         vtxos_data: Vec<(String, u64, bool)>,
-        path: String,
+        signer_set: String,
         cosigner_sk_hex: String,
     ) -> Result<(String, String, Vec<String>, String), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
@@ -415,12 +414,13 @@ impl RbClient {
             })
             .collect::<Result<_, Error>>()?;
 
-        let path = parse_refresh_path(&path)?;
+        let signer_set = parse_signer_set(&signer_set)?;
         let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
         let cosigner_pk = cosigner_kp.public_key();
 
-        let refresh = refresh::prepare_refresh(&contract.inner, &vtxos, path, cosigner_pk, info)
-            .map_err(to_magnus_err)?;
+        let refresh =
+            refresh::prepare_refresh(&contract.inner, &vtxos, signer_set, cosigner_pk, info)
+                .map_err(to_magnus_err)?;
 
         let intent_proof_b64 = psbt_to_base64(&refresh.intent.proof);
         let intent_message_json = refresh.intent.serialize_message().map_err(to_magnus_err)?;
@@ -428,69 +428,6 @@ impl RbClient {
             refresh.forfeit_psbts.iter().map(psbt_to_base64).collect();
         let cosigner_pk_hex =
             bitcoin::hex::DisplayHex::to_lower_hex_string(&refresh.refresh_cosigner_pk.serialize());
-
-        Ok((
-            intent_proof_b64,
-            intent_message_json,
-            forfeit_psbts_b64,
-            cosigner_pk_hex,
-        ))
-    }
-
-    /// Prepare unsigned delegate release PSBTs.
-    ///
-    /// Deprecated: use `prepare_refresh(contract, vtxos, "release", cosigner_sk)`
-    /// followed by the normal offchain release flow.
-    ///
-    /// Returns `[intent_proof_b64, intent_message_json, forfeit_psbts_b64[], cosigner_pk_hex]`.
-    #[allow(deprecated)]
-    fn prepare_release_delegate(
-        &self,
-        contract: &RbContract,
-        vtxos_data: Vec<(String, u64, bool)>,
-        bob_dest_address: String,
-        fee_outputs: Vec<(String, u64)>,
-        cosigner_sk_hex: String,
-    ) -> Result<(String, String, Vec<String>, String), Error> {
-        warn_deprecated(
-            "ArkEscrow: prepare_release_delegate is deprecated; use prepare_refresh(..., 'release') followed by normal offchain release",
-        );
-        let client = self.inner.lock().map_err(to_magnus_err)?;
-        let info = client.server_info().map_err(to_magnus_err)?;
-
-        let vtxos: Vec<DelegateVtxo> = vtxos_data
-            .into_iter()
-            .map(|(outpoint_str, amount_sats, is_swept)| {
-                let outpoint: bitcoin::OutPoint = outpoint_str.parse().map_err(to_magnus_err)?;
-                Ok(DelegateVtxo {
-                    outpoint,
-                    amount: Amount::from_sat(amount_sats),
-                    is_swept,
-                })
-            })
-            .collect::<Result<_, Error>>()?;
-
-        let bob_dest: ark_core::ArkAddress = bob_dest_address.parse().map_err(to_magnus_err)?;
-        let fee_outputs = parse_fee_outputs(fee_outputs)?;
-
-        let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
-        let cosigner_pk = cosigner_kp.public_key();
-
-        let del = delegate::prepare_release_delegate(
-            &contract.inner,
-            &vtxos,
-            &bob_dest,
-            &fee_outputs,
-            cosigner_pk,
-            info,
-        )
-        .map_err(to_magnus_err)?;
-
-        let intent_proof_b64 = psbt_to_base64(&del.intent.proof);
-        let intent_message_json = del.intent.serialize_message().map_err(to_magnus_err)?;
-        let forfeit_psbts_b64: Vec<String> = del.forfeit_psbts.iter().map(psbt_to_base64).collect();
-        let cosigner_pk_hex =
-            bitcoin::hex::DisplayHex::to_lower_hex_string(&cosigner_pk.serialize());
 
         Ok((
             intent_proof_b64,
@@ -540,7 +477,7 @@ impl RbClient {
     /// Execute delegate settlement. Blocks until the batch ceremony completes.
     ///
     /// Deprecated: use `refresh_escrow` for recoverable escrow VTXOs, then the
-    /// normal offchain release/refund flow.
+    /// normal offchain signer-set flow.
     ///
     /// Takes the fully-signed delegate PSBTs and runs the Arkade batch.
     /// Returns the commitment transaction ID (hex string).
@@ -588,8 +525,9 @@ impl RbClient {
         contract: &RbContract,
         escrow_outpoint: String,
         escrow_amount_sats: u64,
-        bob_dest_address: String,
+        buyer_dest_address: String,
         fee_outputs: Vec<(String, u64)>,
+        signer_set: String,
     ) -> Result<(String, Vec<String>), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let info = client.server_info().map_err(to_magnus_err)?;
@@ -600,12 +538,19 @@ impl RbClient {
             amount: Amount::from_sat(escrow_amount_sats),
         };
 
-        let bob_dest: ark_core::ArkAddress = bob_dest_address.parse().map_err(to_magnus_err)?;
+        let buyer_dest: ark_core::ArkAddress = buyer_dest_address.parse().map_err(to_magnus_err)?;
         let fee_outputs = parse_fee_outputs(fee_outputs)?;
+        let signer_set = parse_signer_set(&signer_set)?;
 
-        let release =
-            spend::build_release_tx(&contract.inner, &escrow_vtxo, &bob_dest, &fee_outputs, info)
-                .map_err(to_magnus_err)?;
+        let release = spend::build_release_tx(
+            &contract.inner,
+            &escrow_vtxo,
+            &buyer_dest,
+            &fee_outputs,
+            signer_set,
+            info,
+        )
+        .map_err(to_magnus_err)?;
 
         let ark_tx_b64 = psbt_to_base64(&release.ark_tx);
         let checkpoints_b64: Vec<String> =
@@ -621,7 +566,8 @@ impl RbClient {
         contract: &RbContract,
         escrow_outpoint: String,
         escrow_amount_sats: u64,
-        alice_dest_address: String,
+        seller_dest_address: String,
+        signer_set: String,
     ) -> Result<(String, Vec<String>), Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?;
         let info = client.server_info().map_err(to_magnus_err)?;
@@ -632,10 +578,18 @@ impl RbClient {
             amount: Amount::from_sat(escrow_amount_sats),
         };
 
-        let alice_dest: ark_core::ArkAddress = alice_dest_address.parse().map_err(to_magnus_err)?;
+        let seller_dest: ark_core::ArkAddress =
+            seller_dest_address.parse().map_err(to_magnus_err)?;
+        let signer_set = parse_signer_set(&signer_set)?;
 
-        let refund = spend::build_refund_tx(&contract.inner, &escrow_vtxo, &alice_dest, info)
-            .map_err(to_magnus_err)?;
+        let refund = spend::build_refund_tx(
+            &contract.inner,
+            &escrow_vtxo,
+            &seller_dest,
+            signer_set,
+            info,
+        )
+        .map_err(to_magnus_err)?;
 
         let ark_tx_b64 = psbt_to_base64(&refund.ark_tx);
         let checkpoints_b64: Vec<String> =
@@ -825,18 +779,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         method!(RbClient::get_escrow_vtxo_status, 2),
     )?;
     client_class.define_method("quote_release", method!(RbClient::quote_release, 3))?;
-    client_class.define_method("build_release", method!(RbClient::build_release, 5))?;
-    client_class.define_method("build_refund", method!(RbClient::build_refund, 4))?;
+    client_class.define_method("build_release", method!(RbClient::build_release, 6))?;
+    client_class.define_method("build_refund", method!(RbClient::build_refund, 5))?;
     client_class.define_method(
         "spend_escrow_offchain",
         method!(RbClient::spend_escrow_offchain, 4),
     )?;
     client_class.define_method("prepare_refresh", method!(RbClient::prepare_refresh, 4))?;
     client_class.define_method("refresh_escrow", method!(RbClient::refresh_escrow, 4))?;
-    client_class.define_method(
-        "prepare_release_delegate",
-        method!(RbClient::prepare_release_delegate, 5),
-    )?;
     client_class.define_method("settle_delegate", method!(RbClient::settle_delegate, 4))?;
 
     module.define_module_function("sign_ark_tx", function!(rb_sign_ark_tx, 2))?;
