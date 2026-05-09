@@ -101,7 +101,11 @@ ln -sf target/release/libark_escrow_ruby.dylib target/release/ark_escrow_ruby.bu
 require 'ark_escrow'
 
 # Connect to Arkade (with a custom crash-recovery store)
-client = ArkEscrow::Client.with_custom_store("https://arkade.computer:7070", my_store)
+client = ArkEscrow::Client.with_custom_store(
+  "https://arkade.computer:7070", my_store, timeout_ms: 30_000
+)
+# Optional: update later; use 0 to disable again.
+client.set_timeout_ms(30_000)
 client.connect
 
 # Create contract

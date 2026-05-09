@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::time::Duration;
 
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
@@ -9,11 +10,16 @@ use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
 use bitcoin::{Amount, Network, Psbt, XOnlyPublicKey};
 use magnus::prelude::*;
+use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::value::Opaque;
-use magnus::{Error, Ruby, function, method};
+use magnus::{Error, Ruby, Value, function, method};
 use tokio::runtime::Runtime;
 
 // --- helpers ---
+
+fn timeout_from_ms(timeout_ms: u64) -> Option<Duration> {
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
+}
 
 fn to_magnus_err(e: impl std::fmt::Display) -> Error {
     #[allow(deprecated)]
@@ -211,11 +217,34 @@ impl RbClient {
     ///
     /// - `url`: Arkade gRPC URL.
     /// - `store_dir`: directory for persisting pending spends.
-    fn with_file_store(url: String, store_dir: String) -> Result<Self, Error> {
+    /// - `timeout_ms:` optional Arkade network-operation timeout in milliseconds.
+    fn with_file_store(args: &[Value]) -> Result<Self, Error> {
+        let args = scan_args::<(String, String), (), (), (), _, ()>(args)?;
+        let (url, store_dir) = args.required;
+        let kwargs = get_kwargs::<_, (), (Option<u64>,), ()>(args.keywords, &[], &["timeout_ms"])?;
+        let (timeout_ms,) = kwargs.optional;
+        Self::with_file_store_inner(url, store_dir, timeout_ms.and_then(timeout_from_ms))
+    }
+
+    fn with_file_store_timeout(
+        url: String,
+        store_dir: String,
+        timeout_ms: u64,
+    ) -> Result<Self, Error> {
+        Self::with_file_store_inner(url, store_dir, timeout_from_ms(timeout_ms))
+    }
+
+    fn with_file_store_inner(
+        url: String,
+        store_dir: String,
+        timeout: Option<Duration>,
+    ) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = FileSpendStore::new(&store_dir).map_err(to_magnus_err)?;
+        let mut client = EscrowClient::new(&url);
+        client.set_timeout(timeout);
         Ok(Self {
-            inner: Mutex::new(EscrowClient::new(&url)),
+            inner: Mutex::new(client),
             store: Box::new(store),
             rt,
         })
@@ -233,14 +262,42 @@ impl RbClient {
     /// ID. Long-term, Arkade should surface pending spend status for escrow
     /// VTXOs explicitly so callers do not need to approximate that via the
     /// local crash-recovery store.
-    fn with_custom_store(url: String, rb_store: magnus::Value) -> Result<Self, Error> {
+    fn with_custom_store(args: &[Value]) -> Result<Self, Error> {
+        let args = scan_args::<(String, Value), (), (), (), _, ()>(args)?;
+        let (url, rb_store) = args.required;
+        let kwargs = get_kwargs::<_, (), (Option<u64>,), ()>(args.keywords, &[], &["timeout_ms"])?;
+        let (timeout_ms,) = kwargs.optional;
+        Self::with_custom_store_inner(url, rb_store, timeout_ms.and_then(timeout_from_ms))
+    }
+
+    fn with_custom_store_timeout(
+        url: String,
+        rb_store: magnus::Value,
+        timeout_ms: u64,
+    ) -> Result<Self, Error> {
+        Self::with_custom_store_inner(url, rb_store, timeout_from_ms(timeout_ms))
+    }
+
+    fn with_custom_store_inner(
+        url: String,
+        rb_store: magnus::Value,
+        timeout: Option<Duration>,
+    ) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = CallbackSpendStore::new(rb_store);
+        let mut client = EscrowClient::new(&url);
+        client.set_timeout(timeout);
         Ok(Self {
-            inner: Mutex::new(EscrowClient::new(&url)),
+            inner: Mutex::new(client),
             store: Box::new(store),
             rt,
         })
+    }
+
+    fn set_timeout_ms(&self, timeout_ms: u64) -> Result<(), Error> {
+        let mut client = self.inner.lock().map_err(to_magnus_err)?;
+        client.set_timeout(timeout_from_ms(timeout_ms));
+        Ok(())
     }
 
     fn connect(&self) -> Result<(), Error> {
@@ -265,7 +322,7 @@ impl RbClient {
 
     /// Find the escrow VTXO. Returns [outpoint_str, amount_sats] or nil.
     fn find_escrow_vtxo(&self, contract: &RbContract) -> Result<Option<(String, u64)>, Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let vtxo = self
             .rt
             .block_on(client.find_escrow_vtxo(&contract.inner))
@@ -286,7 +343,7 @@ impl RbClient {
         &self,
         contract: &RbContract,
     ) -> Result<(Vec<(String, u64, bool)>, bool), Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let (vtxos, any_recoverable) = self
             .rt
             .block_on(client.find_refresh_vtxos(&contract.inner))
@@ -328,7 +385,7 @@ impl RbClient {
         contract: &RbContract,
     ) -> Result<(bool, Vec<(String, u64, bool)>, bool), Error> {
         let pending_offchain = self.store.load(&id).map_err(to_magnus_err)?.is_some();
-        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let (vtxos, any_recoverable) = self
             .rt
             .block_on(client.find_refresh_vtxos(&contract.inner))
@@ -356,8 +413,10 @@ impl RbClient {
                 "ArkEscrow: quote_release(..., use_delegate: true) is legacy; refresh first, then quote/build the normal offchain release",
             );
         }
-        let client = self.inner.lock().map_err(to_magnus_err)?;
-        let info = client.server_info().map_err(to_magnus_err)?;
+        let info = {
+            let client = self.inner.lock().map_err(to_magnus_err)?;
+            client.server_info().map_err(to_magnus_err)?.clone()
+        };
         let fee_outputs = parse_fee_outputs(fee_outputs)?;
         let release_plan = plan_release(
             Amount::from_sat(escrow_amount_sats),
@@ -399,8 +458,10 @@ impl RbClient {
         signer_set: String,
         cosigner_sk_hex: String,
     ) -> Result<(String, String, Vec<String>, String), Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
-        let info = client.server_info().map_err(to_magnus_err)?;
+        let info = {
+            let client = self.inner.lock().map_err(to_magnus_err)?;
+            client.server_info().map_err(to_magnus_err)?.clone()
+        };
 
         let vtxos: Vec<RefreshVtxo> = vtxos_data
             .into_iter()
@@ -419,7 +480,7 @@ impl RbClient {
         let cosigner_pk = cosigner_kp.public_key();
 
         let refresh =
-            refresh::prepare_refresh(&contract.inner, &vtxos, signer_set, cosigner_pk, info)
+            refresh::prepare_refresh(&contract.inner, &vtxos, signer_set, cosigner_pk, &info)
                 .map_err(to_magnus_err)?;
 
         let intent_proof_b64 = psbt_to_base64(&refresh.intent.proof);
@@ -448,7 +509,7 @@ impl RbClient {
         forfeit_psbts_b64: Vec<String>,
         cosigner_sk_hex: String,
     ) -> Result<String, Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
         let intent_proof = psbt_from_base64(&intent_proof_b64)?;
         let intent_message: ark_core::intent::IntentMessage =
@@ -492,7 +553,7 @@ impl RbClient {
         warn_deprecated(
             "ArkEscrow: settle_delegate is deprecated; use refresh_escrow for recoverable escrow VTXOs",
         );
-        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
         let intent_proof = psbt_from_base64(&intent_proof_b64)?;
         let intent_message: ark_core::intent::IntentMessage =
@@ -529,8 +590,10 @@ impl RbClient {
         fee_outputs: Vec<(String, u64)>,
         signer_set: String,
     ) -> Result<(String, Vec<String>), Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
-        let info = client.server_info().map_err(to_magnus_err)?;
+        let info = {
+            let client = self.inner.lock().map_err(to_magnus_err)?;
+            client.server_info().map_err(to_magnus_err)?.clone()
+        };
 
         let outpoint: bitcoin::OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
         let escrow_vtxo = spend::EscrowVtxo {
@@ -548,7 +611,7 @@ impl RbClient {
             &buyer_dest,
             &fee_outputs,
             signer_set,
-            info,
+            &info,
         )
         .map_err(to_magnus_err)?;
 
@@ -569,8 +632,10 @@ impl RbClient {
         seller_dest_address: String,
         signer_set: String,
     ) -> Result<(String, Vec<String>), Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
-        let info = client.server_info().map_err(to_magnus_err)?;
+        let info = {
+            let client = self.inner.lock().map_err(to_magnus_err)?;
+            client.server_info().map_err(to_magnus_err)?.clone()
+        };
 
         let outpoint: bitcoin::OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
         let escrow_vtxo = spend::EscrowVtxo {
@@ -587,7 +652,7 @@ impl RbClient {
             &escrow_vtxo,
             &seller_dest,
             signer_set,
-            info,
+            &info,
         )
         .map_err(to_magnus_err)?;
 
@@ -617,7 +682,7 @@ impl RbClient {
         unsigned_checkpoint_txs_b64: Vec<String>,
         party_signed_checkpoints_b64: Vec<Vec<String>>,
     ) -> Result<String, Error> {
-        let client = self.inner.lock().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
         let merged_ark_tx = psbt_from_base64(&merged_ark_tx_b64)?;
         let unsigned_checkpoints: Vec<Psbt> = unsigned_checkpoint_txs_b64
@@ -757,11 +822,20 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     let client_class = module.define_class("Client", ruby.class_object())?;
     client_class
-        .define_singleton_method("with_file_store", function!(RbClient::with_file_store, 2))?;
+        .define_singleton_method("with_file_store", function!(RbClient::with_file_store, -1))?;
+    client_class.define_singleton_method(
+        "with_file_store_timeout",
+        function!(RbClient::with_file_store_timeout, 3),
+    )?;
     client_class.define_singleton_method(
         "with_custom_store",
-        function!(RbClient::with_custom_store, 2),
+        function!(RbClient::with_custom_store, -1),
     )?;
+    client_class.define_singleton_method(
+        "with_custom_store_timeout",
+        function!(RbClient::with_custom_store_timeout, 3),
+    )?;
+    client_class.define_method("set_timeout_ms", method!(RbClient::set_timeout_ms, 1))?;
     client_class.define_method("connect", method!(RbClient::connect, 0))?;
     client_class.define_method("server_pk", method!(RbClient::server_pk, 0))?;
     client_class.define_method(

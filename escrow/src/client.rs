@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ark_core::VtxoList;
@@ -16,9 +18,11 @@ use crate::spend::{self, EscrowVtxo};
 use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
 
 /// Wraps an `ark_grpc::Client` with escrow-specific helpers.
+#[derive(Clone)]
 pub struct EscrowClient {
     grpc: ark_grpc::Client,
     server_info: Option<server::Info>,
+    timeout: Option<Duration>,
 }
 
 impl EscrowClient {
@@ -26,15 +30,37 @@ impl EscrowClient {
         Self {
             grpc: ark_grpc::Client::new(url.to_string()),
             server_info: None,
+            timeout: None,
         }
+    }
+
+    pub fn new_with_timeout(url: &str, timeout: Duration) -> Self {
+        let mut client = Self::new(url);
+        client.set_timeout(Some(timeout));
+        client
+    }
+
+    /// Set the timeout applied to Arkade network operations. `None` disables
+    /// wrapper-level timeouts.
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     /// Connect to the Arkade server and fetch server info.
     pub async fn connect(&mut self) -> Result<&server::Info> {
         // Ensure a TLS crypto provider is installed (needed for https:// URLs)
         let _ = rustls::crypto::ring::default_provider().install_default();
-        self.grpc.connect().await.context("connecting to Arkade")?;
-        let info = self.grpc.get_info().await.context("getting server info")?;
+        Self::run_with_timeout(self.timeout, "connecting to Arkade", self.grpc.connect())
+            .await
+            .context("connecting to Arkade")?;
+        let info =
+            Self::run_with_timeout(self.timeout, "getting server info", self.grpc.get_info())
+                .await
+                .context("getting server info")?;
         self.server_info = Some(info);
         Ok(self.server_info.as_ref().unwrap())
     }
@@ -54,11 +80,10 @@ impl EscrowClient {
         let address = contract.address();
 
         let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
-        let response = self
-            .grpc
-            .list_vtxos(request)
-            .await
-            .context("listing VTXOs")?;
+        let response =
+            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
+                .await
+                .context("listing VTXOs")?;
 
         let vtxo_list = VtxoList::new(info.dust, response.vtxos);
 
@@ -83,11 +108,10 @@ impl EscrowClient {
         let address = contract.address();
 
         let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
-        let response = self
-            .grpc
-            .list_vtxos(request)
-            .await
-            .context("listing VTXOs")?;
+        let response =
+            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
+                .await
+                .context("listing VTXOs")?;
 
         let vtxo_list = VtxoList::new(info.dust, response.vtxos);
 
@@ -152,8 +176,18 @@ impl EscrowClient {
         let info = self.server_info()?;
         let mut rng = OsRng;
 
-        crate::refresh::execute_refresh(&self.grpc, info, &mut rng, refresh, refresh_cosigner_kp)
-            .await
+        Self::run_with_timeout(
+            self.timeout,
+            "refreshing escrow",
+            crate::refresh::execute_refresh(
+                &self.grpc,
+                info,
+                &mut rng,
+                refresh,
+                refresh_cosigner_kp,
+            ),
+        )
+        .await
     }
 
     /// Execute a delegate settlement via the Arkade batch ceremony.
@@ -168,7 +202,12 @@ impl EscrowClient {
         let mut rng = OsRng;
 
         #[allow(deprecated)]
-        crate::delegate::settle_delegate(&self.grpc, info, &mut rng, delegate, cosigner_kp).await
+        Self::run_with_timeout(
+            self.timeout,
+            "settling delegate",
+            crate::delegate::settle_delegate(&self.grpc, info, &mut rng, delegate, cosigner_kp),
+        )
+        .await
     }
 
     /// Spend an escrow VTXO offchain with crash recovery via the
@@ -291,11 +330,14 @@ impl EscrowClient {
     ) -> Result<(Txid, Vec<Psbt>)> {
         let ark_txid = ark_tx.unsigned_tx.compute_txid();
 
-        let res = self
-            .grpc
-            .submit_offchain_transaction_request(ark_tx, checkpoint_txs.clone())
-            .await
-            .context("submitting offchain transaction")?;
+        let res = Self::run_with_timeout(
+            self.timeout,
+            "submitting offchain transaction",
+            self.grpc
+                .submit_offchain_transaction_request(ark_tx, checkpoint_txs.clone()),
+        )
+        .await
+        .context("submitting offchain transaction")?;
 
         // Build a map from original checkpoint txid → witness_script so we can
         // restore witness_script on the server-returned checkpoints (the server
@@ -330,11 +372,35 @@ impl EscrowClient {
         ark_txid: Txid,
         signed_checkpoint_txs: Vec<Psbt>,
     ) -> Result<()> {
-        self.grpc
-            .finalize_offchain_transaction(ark_txid, signed_checkpoint_txs)
-            .await
-            .context("finalizing offchain transaction")?;
+        Self::run_with_timeout(
+            self.timeout,
+            "finalizing offchain transaction",
+            self.grpc
+                .finalize_offchain_transaction(ark_txid, signed_checkpoint_txs),
+        )
+        .await
+        .context("finalizing offchain transaction")?;
         Ok(())
+    }
+
+    async fn run_with_timeout<T, E, F>(
+        timeout: Option<Duration>,
+        operation: &'static str,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T, E>>,
+        E: Into<anyhow::Error>,
+    {
+        match timeout {
+            Some(duration) => tokio::time::timeout(duration, future)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("{operation} timed out after {}ms", duration.as_millis())
+                })?
+                .map_err(Into::into),
+            None => future.await.map_err(Into::into),
+        }
     }
 
     /// Merge server-signed checkpoints with each party's signed checkpoints.
