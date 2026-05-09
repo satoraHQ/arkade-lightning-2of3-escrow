@@ -161,6 +161,7 @@ fn build_intent_inputs(
                 (spend_script.clone(), control_block.clone()),
                 false,
                 vtxo.is_swept,
+                Vec::new(),
             )
         })
         .collect()

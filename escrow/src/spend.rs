@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use ark_core::send::{self, OffchainTransactions, VtxoInput};
+use ark_core::send::{self, OffchainTransactions, SendReceiver, VtxoInput};
 use ark_core::server;
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
@@ -53,6 +53,7 @@ pub fn build_release_tx(
         contract.script_pubkey(),
         escrow_vtxo.amount,
         escrow_vtxo.outpoint,
+        Vec::new(),
     );
 
     let release_plan = plan_release(
@@ -62,19 +63,22 @@ pub fn build_release_tx(
         server_info.dust,
     )?;
 
-    let mut outputs: Vec<(&ark_core::ArkAddress, Amount)> = Vec::new();
-    outputs.push((buyer_dest, release_plan.buyer_amount));
+    let mut receivers = Vec::new();
+    receivers.push(SendReceiver::bitcoin(
+        *buyer_dest,
+        release_plan.buyer_amount,
+    ));
 
     for fee_output in &release_plan.effective_fee_outputs {
-        outputs.push((&fee_output.address, fee_output.amount));
+        receivers.push(SendReceiver::bitcoin(fee_output.address, fee_output.amount));
     }
 
     let OffchainTransactions {
         ark_tx,
         checkpoint_txs,
     } = send::build_offchain_transactions(
-        &outputs,
-        None, // no change — full spend
+        &receivers,
+        buyer_dest, // no change expected — full spend
         std::slice::from_ref(&vtxo_input),
         server_info,
     )
@@ -107,16 +111,17 @@ pub fn build_refund_tx(
         contract.script_pubkey(),
         escrow_vtxo.amount,
         escrow_vtxo.outpoint,
+        Vec::new(),
     );
 
-    let outputs = [(seller_dest, escrow_vtxo.amount)];
+    let receivers = [SendReceiver::bitcoin(*seller_dest, escrow_vtxo.amount)];
 
     let OffchainTransactions {
         ark_tx,
         checkpoint_txs,
     } = send::build_offchain_transactions(
-        &outputs,
-        None,
+        &receivers,
+        seller_dest,
         std::slice::from_ref(&vtxo_input),
         server_info,
     )

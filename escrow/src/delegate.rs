@@ -221,6 +221,7 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
     loop {
         match stream.next().await {
             Some(Ok(event)) => match event {
+                StreamEvent::StreamStarted(_) => {}
                 StreamEvent::BatchStarted(e) => {
                     if step != Step::Start {
                         continue;
@@ -470,6 +471,7 @@ fn build_intent_inputs(
                 (spend_script.clone(), control_block.clone()),
                 false,
                 vtxo.is_swept,
+                Vec::new(),
             )
         })
         .collect()

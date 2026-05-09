@@ -5,8 +5,8 @@ edition = "2024"
 rust-version = "1.86"
 
 [dependencies]
-ark-core = "0.8"
-ark-grpc = { version = "0.8", default-features = false, features = ["tls-native-roots"] }
+ark-core = "0.9"
+ark-grpc = { version = "0.9", default-features = false, features = ["tls-native-roots"] }
 futures = "0.3"
 rand = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
