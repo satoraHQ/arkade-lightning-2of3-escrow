@@ -58,6 +58,9 @@ let mut client = EscrowClient::new("https://arkade.computer:7070");
 let info = client.connect().await?;
 let vtxo = client.find_escrow_vtxo(&contract).await?
     .expect("escrow VTXO not found");
+// Note: find_escrow_vtxo returns the first spendable VTXO. If an escrow
+// address was funded more than once, use find_spendable_escrow_vtxos or
+// build_release_for_outpoint/build_refund_for_outpoint to choose one.
 
 // 3. Build release transaction (with fee outputs and chosen signer set)
 let fee_outputs = vec![
@@ -114,13 +117,20 @@ contract = ArkEscrow::Contract.new(
   client.unilateral_exit_delay, "bitcoin"
 )
 
-# Find funded VTXO
+# Find funded VTXO. This returns the first spendable VTXO; if the escrow was
+# funded more than once, use find_spendable_escrow_vtxos and choose an outpoint.
 outpoint, amount = client.find_escrow_vtxo(contract)
 
 # Build buyer + arbiter spend (with fee outputs as [address, sats] pairs)
 fee_outputs = [["ark1...fee", 100]]
 ark_tx_b64, checkpoint_b64s = client.build_release(
   contract, outpoint, amount, buyer_dest_address, fee_outputs, "buyer_arbiter"
+)
+
+# Or choose a specific spendable VTXO and let the SDK load its amount from Arkade.
+vtxos = client.find_spendable_escrow_vtxos(contract) # [[outpoint, amount_sats], ...]
+ark_tx_b64, checkpoint_b64s = client.build_release_for_outpoint(
+  contract, vtxos.first[0], buyer_dest_address, fee_outputs, "buyer_arbiter"
 )
 
 # Sign and merge

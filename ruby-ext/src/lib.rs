@@ -8,7 +8,7 @@ use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
-use bitcoin::{Amount, Network, Psbt, XOnlyPublicKey};
+use bitcoin::{Amount, Network, OutPoint, Psbt, XOnlyPublicKey};
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::value::Opaque;
@@ -320,7 +320,11 @@ impl RbClient {
         Ok(info.unilateral_exit_delay.to_consensus_u32())
     }
 
-    /// Find the escrow VTXO. Returns [outpoint_str, amount_sats] or nil.
+    /// Find the first spendable escrow VTXO. Returns [outpoint_str, amount_sats] or nil.
+    ///
+    /// If the escrow address was funded more than once, use
+    /// `find_spendable_escrow_vtxos` or `build_release_for_outpoint` to choose
+    /// a specific VTXO.
     fn find_escrow_vtxo(&self, contract: &RbContract) -> Result<Option<(String, u64)>, Error> {
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let vtxo = self
@@ -328,6 +332,24 @@ impl RbClient {
             .block_on(client.find_escrow_vtxo(&contract.inner))
             .map_err(to_magnus_err)?;
         Ok(vtxo.map(|v| (v.outpoint.to_string(), v.amount.to_sat())))
+    }
+
+    /// Find all spendable offchain escrow VTXOs.
+    ///
+    /// Returns `[[outpoint, amount_sats], ...]`.
+    fn find_spendable_escrow_vtxos(
+        &self,
+        contract: &RbContract,
+    ) -> Result<Vec<(String, u64)>, Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+        let vtxos = self
+            .rt
+            .block_on(client.find_spendable_escrow_vtxos(&contract.inner))
+            .map_err(to_magnus_err)?;
+        Ok(vtxos
+            .iter()
+            .map(|v| (v.outpoint.to_string(), v.amount.to_sat()))
+            .collect())
     }
 
     /// Find all unspent escrow VTXOs and check recoverability.
@@ -622,6 +644,42 @@ impl RbClient {
         Ok((ark_tx_b64, checkpoints_b64))
     }
 
+    /// Build a release transaction for a specific spendable VTXO outpoint.
+    ///
+    /// Returns the ark_tx PSBT (base64) and checkpoint PSBTs (array of base64).
+    /// The VTXO amount is loaded from Arkade.
+    fn build_release_for_outpoint(
+        &self,
+        contract: &RbContract,
+        escrow_outpoint: String,
+        buyer_dest_address: String,
+        fee_outputs: Vec<(String, u64)>,
+        signer_set: String,
+    ) -> Result<(String, Vec<String>), Error> {
+        let outpoint: OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
+        let buyer_dest: ark_core::ArkAddress = buyer_dest_address.parse().map_err(to_magnus_err)?;
+        let fee_outputs = parse_fee_outputs(fee_outputs)?;
+        let signer_set = parse_signer_set(&signer_set)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+
+        let release = self
+            .rt
+            .block_on(client.build_release_for_outpoint(
+                &contract.inner,
+                outpoint,
+                &buyer_dest,
+                &fee_outputs,
+                signer_set,
+            ))
+            .map_err(to_magnus_err)?;
+
+        let ark_tx_b64 = psbt_to_base64(&release.ark_tx);
+        let checkpoints_b64: Vec<String> =
+            release.checkpoint_txs.iter().map(psbt_to_base64).collect();
+
+        Ok((ark_tx_b64, checkpoints_b64))
+    }
+
     /// Build a refund transaction. Returns the ark_tx PSBT (base64) and
     /// checkpoint PSBTs (array of base64).
     fn build_refund(
@@ -655,6 +713,40 @@ impl RbClient {
             &info,
         )
         .map_err(to_magnus_err)?;
+
+        let ark_tx_b64 = psbt_to_base64(&refund.ark_tx);
+        let checkpoints_b64: Vec<String> =
+            refund.checkpoint_txs.iter().map(psbt_to_base64).collect();
+
+        Ok((ark_tx_b64, checkpoints_b64))
+    }
+
+    /// Build a refund transaction for a specific spendable VTXO outpoint.
+    ///
+    /// Returns the ark_tx PSBT (base64) and checkpoint PSBTs (array of base64).
+    /// The VTXO amount is loaded from Arkade.
+    fn build_refund_for_outpoint(
+        &self,
+        contract: &RbContract,
+        escrow_outpoint: String,
+        seller_dest_address: String,
+        signer_set: String,
+    ) -> Result<(String, Vec<String>), Error> {
+        let outpoint: OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
+        let seller_dest: ark_core::ArkAddress =
+            seller_dest_address.parse().map_err(to_magnus_err)?;
+        let signer_set = parse_signer_set(&signer_set)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+
+        let refund = self
+            .rt
+            .block_on(client.build_refund_for_outpoint(
+                &contract.inner,
+                outpoint,
+                &seller_dest,
+                signer_set,
+            ))
+            .map_err(to_magnus_err)?;
 
         let ark_tx_b64 = psbt_to_base64(&refund.ark_tx);
         let checkpoints_b64: Vec<String> =
@@ -844,6 +936,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method("find_escrow_vtxo", method!(RbClient::find_escrow_vtxo, 1))?;
     client_class.define_method(
+        "find_spendable_escrow_vtxos",
+        method!(RbClient::find_spendable_escrow_vtxos, 1),
+    )?;
+    client_class.define_method(
         "find_refresh_vtxos",
         method!(RbClient::find_refresh_vtxos, 1),
     )?;
@@ -854,7 +950,15 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method("quote_release", method!(RbClient::quote_release, 3))?;
     client_class.define_method("build_release", method!(RbClient::build_release, 6))?;
+    client_class.define_method(
+        "build_release_for_outpoint",
+        method!(RbClient::build_release_for_outpoint, 5),
+    )?;
     client_class.define_method("build_refund", method!(RbClient::build_refund, 5))?;
+    client_class.define_method(
+        "build_refund_for_outpoint",
+        method!(RbClient::build_refund_for_outpoint, 4),
+    )?;
     client_class.define_method(
         "spend_escrow_offchain",
         method!(RbClient::spend_escrow_offchain, 4),

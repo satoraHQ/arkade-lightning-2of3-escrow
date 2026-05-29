@@ -7,10 +7,11 @@ use ark_core::VtxoList;
 use ark_core::batch::Delegate;
 use ark_core::server::{self, GetVtxosRequest};
 use bitcoin::key::Keypair;
-use bitcoin::{Psbt, Txid};
+use bitcoin::{OutPoint, Psbt, Txid};
 use rand::rngs::OsRng;
 
-use crate::contract::EscrowContract;
+use crate::FeeOutput;
+use crate::contract::{EscrowContract, SignerSet};
 #[allow(deprecated)]
 use crate::delegate::DelegateVtxo;
 use crate::refresh::{RefreshIntent, RefreshVtxo};
@@ -74,8 +75,22 @@ impl EscrowClient {
     /// Find the escrow VTXO on Arkade by looking up the contract's address.
     ///
     /// Returns the first spendable offchain VTXO matching the escrow address,
-    /// or None if no funded escrow exists.
+    /// or None if no funded escrow exists. If the escrow address was funded
+    /// more than once, use [`EscrowClient::find_spendable_escrow_vtxos`] or
+    /// [`EscrowClient::build_release_for_outpoint`] to choose a specific VTXO.
     pub async fn find_escrow_vtxo(&self, contract: &EscrowContract) -> Result<Option<EscrowVtxo>> {
+        Ok(self
+            .find_spendable_escrow_vtxos(contract)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Find all escrow VTXOs that can currently be spent offchain.
+    pub async fn find_spendable_escrow_vtxos(
+        &self,
+        contract: &EscrowContract,
+    ) -> Result<Vec<EscrowVtxo>> {
         let info = self.server_info()?;
         let address = contract.address();
 
@@ -87,12 +102,74 @@ impl EscrowClient {
 
         let vtxo_list = VtxoList::new(info.dust, response.vtxos);
 
-        let vtxo = vtxo_list.spendable_offchain().next();
+        Ok(vtxo_list
+            .spendable_offchain()
+            .map(|v| EscrowVtxo {
+                outpoint: v.outpoint,
+                amount: v.amount,
+            })
+            .collect())
+    }
 
-        Ok(vtxo.map(|v| EscrowVtxo {
-            outpoint: v.outpoint,
-            amount: v.amount,
-        }))
+    /// Find one spendable escrow VTXO by outpoint.
+    pub async fn find_spendable_escrow_vtxo_by_outpoint(
+        &self,
+        contract: &EscrowContract,
+        outpoint: OutPoint,
+    ) -> Result<Option<EscrowVtxo>> {
+        Ok(self
+            .find_spendable_escrow_vtxos(contract)
+            .await?
+            .into_iter()
+            .find(|v| v.outpoint == outpoint))
+    }
+
+    /// Build a release transaction for a specific spendable escrow VTXO.
+    ///
+    /// The VTXO amount is loaded from Arkade, avoiding caller-supplied amount
+    /// mismatches when the escrow address has multiple VTXOs.
+    pub async fn build_release_for_outpoint(
+        &self,
+        contract: &EscrowContract,
+        outpoint: OutPoint,
+        buyer_dest: &ark_core::ArkAddress,
+        fee_outputs: &[FeeOutput],
+        signer_set: SignerSet,
+    ) -> Result<spend::EscrowTransaction> {
+        let escrow_vtxo = self
+            .find_spendable_escrow_vtxo_by_outpoint(contract, outpoint)
+            .await?
+            .with_context(|| format!("spendable escrow VTXO not found: {outpoint}"))?;
+        let info = self.server_info()?;
+
+        spend::build_release_tx(
+            contract,
+            &escrow_vtxo,
+            buyer_dest,
+            fee_outputs,
+            signer_set,
+            info,
+        )
+    }
+
+    /// Build a refund transaction for a specific spendable escrow VTXO.
+    ///
+    /// The VTXO amount is loaded from Arkade, avoiding caller-supplied amount
+    /// mismatches when the escrow address has multiple VTXOs.
+    pub async fn build_refund_for_outpoint(
+        &self,
+        contract: &EscrowContract,
+        outpoint: OutPoint,
+        seller_dest: &ark_core::ArkAddress,
+        signer_set: SignerSet,
+    ) -> Result<spend::EscrowTransaction> {
+        let escrow_vtxo = self
+            .find_spendable_escrow_vtxo_by_outpoint(contract, outpoint)
+            .await?
+            .with_context(|| format!("spendable escrow VTXO not found: {outpoint}"))?;
+        let info = self.server_info()?;
+
+        spend::build_refund_tx(contract, &escrow_vtxo, seller_dest, signer_set, info)
     }
 
     /// Find all unspent escrow VTXOs and report whether any are recoverable.
