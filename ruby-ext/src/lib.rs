@@ -352,6 +352,35 @@ impl RbClient {
             .collect())
     }
 
+    /// Find all unspent escrow VTXOs with status metadata for caller-side selection.
+    ///
+    /// Returns `[[outpoint, amount_sats, created_at, expires_at, spendable_offchain, recoverable, is_swept], ...]`.
+    #[allow(clippy::type_complexity)]
+    fn find_escrow_vtxo_statuses(
+        &self,
+        contract: &RbContract,
+    ) -> Result<Vec<(String, u64, i64, i64, bool, bool, bool)>, Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+        let statuses = self
+            .rt
+            .block_on(client.find_escrow_vtxo_statuses(&contract.inner))
+            .map_err(to_magnus_err)?;
+        Ok(statuses
+            .iter()
+            .map(|v| {
+                (
+                    v.outpoint.to_string(),
+                    v.amount.to_sat(),
+                    v.created_at,
+                    v.expires_at,
+                    v.spendable_offchain,
+                    v.recoverable,
+                    v.is_swept,
+                )
+            })
+            .collect())
+    }
+
     /// Find all unspent escrow VTXOs and check recoverability.
     ///
     /// Returns `[vtxos_array, any_recoverable]` where vtxos_array is
@@ -938,6 +967,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     client_class.define_method(
         "find_spendable_escrow_vtxos",
         method!(RbClient::find_spendable_escrow_vtxos, 1),
+    )?;
+    client_class.define_method(
+        "find_escrow_vtxo_statuses",
+        method!(RbClient::find_escrow_vtxo_statuses, 1),
     )?;
     client_class.define_method(
         "find_refresh_vtxos",

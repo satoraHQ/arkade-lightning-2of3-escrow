@@ -133,6 +133,14 @@ ark_tx_b64, checkpoint_b64s = client.build_release_for_outpoint(
   contract, vtxos.first[0], buyer_dest_address, fee_outputs, "buyer_arbiter"
 )
 
+# For application-specific selection, inspect all unspent VTXOs and decide locally.
+# Tuple: [outpoint, amount_sats, created_at, expires_at, spendable_offchain, recoverable, is_swept]
+oldest = client.find_escrow_vtxo_statuses(contract).min_by { |v| v[2] }
+raise "oldest escrow VTXO is not spendable" unless oldest && oldest[4]
+ark_tx_b64, checkpoint_b64s = client.build_release_for_outpoint(
+  contract, oldest[0], buyer_dest_address, fee_outputs, "buyer_arbiter"
+)
+
 # Sign and merge
 signed = ArkEscrow.sign_ark_tx(ark_tx_b64, secret_key_hex)
 merged = ArkEscrow.merge_sigs(signed, other_signed)

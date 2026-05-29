@@ -18,6 +18,17 @@ use crate::refresh::{RefreshIntent, RefreshVtxo};
 use crate::spend::{self, EscrowVtxo};
 use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
 
+#[derive(Clone, Debug)]
+pub struct EscrowVtxoStatus {
+    pub outpoint: OutPoint,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub amount: bitcoin::Amount,
+    pub spendable_offchain: bool,
+    pub recoverable: bool,
+    pub is_swept: bool,
+}
+
 /// Wraps an `ark_grpc::Client` with escrow-specific helpers.
 #[derive(Clone)]
 pub struct EscrowClient {
@@ -108,6 +119,45 @@ impl EscrowClient {
                 outpoint: v.outpoint,
                 amount: v.amount,
             })
+            .collect())
+    }
+
+    /// Find all unspent escrow VTXOs with enough status metadata for caller-side selection.
+    pub async fn find_escrow_vtxo_statuses(
+        &self,
+        contract: &EscrowContract,
+    ) -> Result<Vec<EscrowVtxoStatus>> {
+        let info = self.server_info()?;
+        let address = contract.address();
+
+        let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
+        let response =
+            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
+                .await
+                .context("listing VTXOs")?;
+
+        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+
+        Ok(vtxo_list
+            .spendable_offchain()
+            .map(|v| EscrowVtxoStatus {
+                outpoint: v.outpoint,
+                created_at: v.created_at,
+                expires_at: v.expires_at,
+                amount: v.amount,
+                spendable_offchain: true,
+                recoverable: false,
+                is_swept: v.is_swept,
+            })
+            .chain(vtxo_list.recoverable().map(|v| EscrowVtxoStatus {
+                outpoint: v.outpoint,
+                created_at: v.created_at,
+                expires_at: v.expires_at,
+                amount: v.amount,
+                spendable_offchain: false,
+                recoverable: true,
+                is_swept: v.is_swept,
+            }))
             .collect())
     }
 
