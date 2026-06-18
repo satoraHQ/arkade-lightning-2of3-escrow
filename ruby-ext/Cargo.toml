@@ -9,8 +9,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ark-escrow = { path = "../escrow" }
-ark-core = "0.9"
-ark-grpc = { version = "0.9", default-features = false, features = ["tls-native-roots"] }
+ark-core = { git = "https://github.com/arkade-os/rust-sdk.git", branch = "master" }
+ark-grpc = { git = "https://github.com/arkade-os/rust-sdk.git", branch = "master", default-features = false, features = ["tls-native-roots"] }
 anyhow = "1"
 bitcoin = { version = "0.32.7", features = ["base64", "rand", "serde"] }
 magnus = { version = "0.8", features = ["rb-sys"] }
