@@ -2,8 +2,8 @@
 //!
 //! Refreshing is the recovery path for escrow VTXOs that are no longer
 //! spendable via the normal offchain path. A refresh settles one or more
-//! recoverable escrow VTXOs into a single new VTXO at the same escrow address.
-//! Once that new VTXO is spendable, callers should use the normal
+//! recoverable escrow VTXOs into a single new VTXO at the active-signer escrow
+//! address. Once that new VTXO is spendable, callers should use the normal
 //! offchain flow.
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use ark_core::intent;
 use ark_core::server;
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
-use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Txid, XOnlyPublicKey};
+use bitcoin::{Amount, OutPoint, Psbt, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
 
 use crate::contract::{EscrowContract, SignerSet};
@@ -55,10 +55,17 @@ impl RefreshIntent {
     }
 }
 
+pub(crate) struct RefreshInput<'a> {
+    pub contract: &'a EscrowContract,
+    pub vtxo: &'a RefreshVtxo,
+}
+
 /// Prepare unsigned refresh PSBTs.
 ///
 /// The refresh consumes one or more recoverable escrow VTXOs and creates a
-/// single offchain output back to `contract.address()` for the full input sum.
+/// single offchain output for the full input sum. If the Arkade signer has
+/// rotated, inputs are spent from `contract` while the output is created at the
+/// same escrow template using the current `server_info.signer_pk`.
 /// No final destination or fee outputs are included here; callers
 /// should perform the normal offchain signer-set spend after the refreshed VTXO
 /// becomes spendable.
@@ -69,22 +76,34 @@ pub fn prepare_refresh(
     refresh_cosigner_pk: secp256k1::PublicKey,
     server_info: &server::Info,
 ) -> Result<RefreshIntent> {
-    let spend_script = signer_set.script(contract.options());
-    let control_block = contract.control_block(&spend_script)?;
-    let tapscripts = contract.tapscripts();
-    let script_pubkey = contract.script_pubkey();
+    let inputs = vtxos
+        .iter()
+        .map(|vtxo| RefreshInput { contract, vtxo })
+        .collect::<Vec<_>>();
 
-    let intent_inputs = build_intent_inputs(
-        vtxos,
-        &spend_script,
-        &control_block,
-        &tapscripts,
-        &script_pubkey,
-    );
+    prepare_refresh_resolved(
+        contract,
+        &inputs,
+        signer_set,
+        refresh_cosigner_pk,
+        server_info,
+    )
+}
 
-    let total_escrow_amount: Amount = vtxos.iter().map(|v| v.amount).sum();
+pub(crate) fn prepare_refresh_resolved(
+    output_template_contract: &EscrowContract,
+    inputs: &[RefreshInput<'_>],
+    signer_set: SignerSet,
+    refresh_cosigner_pk: secp256k1::PublicKey,
+    server_info: &server::Info,
+) -> Result<RefreshIntent> {
+    let intent_inputs = build_intent_inputs(inputs, signer_set)?;
+
+    let total_escrow_amount: Amount = inputs.iter().map(|input| input.vtxo.amount).sum();
+    let active_server: XOnlyPublicKey = server_info.signer_pk.into();
+    let output_contract = output_template_contract.with_server(active_server)?;
     let outputs = vec![intent::Output::Offchain(bitcoin::TxOut {
-        script_pubkey: contract.address().to_p2tr_script_pubkey(),
+        script_pubkey: output_contract.address().to_p2tr_script_pubkey(),
         value: total_escrow_amount,
     })];
 
@@ -140,29 +159,29 @@ pub async fn execute_refresh<R: Rng + CryptoRng>(
 }
 
 fn build_intent_inputs(
-    vtxos: &[RefreshVtxo],
-    spend_script: &ScriptBuf,
-    control_block: &bitcoin::taproot::ControlBlock,
-    tapscripts: &[ScriptBuf],
-    script_pubkey: &ScriptBuf,
-) -> Vec<intent::Input> {
-    vtxos
+    inputs: &[RefreshInput<'_>],
+    signer_set: SignerSet,
+) -> Result<Vec<intent::Input>> {
+    inputs
         .iter()
-        .map(|vtxo| {
-            intent::Input::new(
-                vtxo.outpoint,
+        .map(|input| {
+            let spend_script = signer_set.script(input.contract.options());
+            let control_block = input.contract.control_block(&spend_script)?;
+
+            Ok(intent::Input::new(
+                input.vtxo.outpoint,
                 bitcoin::Sequence::ZERO,
                 None,
                 bitcoin::TxOut {
-                    value: vtxo.amount,
-                    script_pubkey: script_pubkey.clone(),
+                    value: input.vtxo.amount,
+                    script_pubkey: input.contract.script_pubkey(),
                 },
-                tapscripts.to_vec(),
-                (spend_script.clone(), control_block.clone()),
+                input.contract.tapscripts(),
+                (spend_script, control_block),
                 false,
-                vtxo.is_swept,
+                input.vtxo.is_swept,
                 Vec::new(),
-            )
+            ))
         })
         .collect()
 }
