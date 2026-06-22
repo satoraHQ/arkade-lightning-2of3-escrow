@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
-use ark_escrow::refresh::{self, RefreshIntent, RefreshVtxo};
+use ark_escrow::refresh::{RefreshIntent, RefreshVtxo};
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
@@ -466,7 +466,7 @@ impl RbClient {
         }
         let info = {
             let client = self.inner.lock().map_err(to_magnus_err)?;
-            client.server_info().map_err(to_magnus_err)?.clone()
+            client.server_info().map_err(to_magnus_err)?
         };
         let fee_outputs = parse_fee_outputs(fee_outputs)?;
         let release_plan = plan_release(
@@ -509,11 +509,6 @@ impl RbClient {
         signer_set: String,
         cosigner_sk_hex: String,
     ) -> Result<(String, String, Vec<String>, String), Error> {
-        let info = {
-            let client = self.inner.lock().map_err(to_magnus_err)?;
-            client.server_info().map_err(to_magnus_err)?.clone()
-        };
-
         let vtxos: Vec<RefreshVtxo> = vtxos_data
             .into_iter()
             .map(|(outpoint_str, amount_sats, is_swept)| {
@@ -529,10 +524,12 @@ impl RbClient {
         let signer_set = parse_signer_set(&signer_set)?;
         let cosigner_kp = parse_secret_key(&cosigner_sk_hex)?;
         let cosigner_pk = cosigner_kp.public_key();
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
-        let refresh =
-            refresh::prepare_refresh(&contract.inner, &vtxos, signer_set, cosigner_pk, &info)
-                .map_err(to_magnus_err)?;
+        let refresh = self
+            .rt
+            .block_on(client.prepare_refresh(&contract.inner, &vtxos, signer_set, cosigner_pk))
+            .map_err(to_magnus_err)?;
 
         let intent_proof_b64 = psbt_to_base64(&refresh.intent.proof);
         let intent_message_json = refresh.intent.serialize_message().map_err(to_magnus_err)?;
@@ -636,35 +633,27 @@ impl RbClient {
         &self,
         contract: &RbContract,
         escrow_outpoint: String,
-        escrow_amount_sats: u64,
+        _escrow_amount_sats: u64,
         buyer_dest_address: String,
         fee_outputs: Vec<(String, u64)>,
         signer_set: String,
     ) -> Result<(String, Vec<String>), Error> {
-        let info = {
-            let client = self.inner.lock().map_err(to_magnus_err)?;
-            client.server_info().map_err(to_magnus_err)?.clone()
-        };
-
         let outpoint: bitcoin::OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
-        let escrow_vtxo = spend::EscrowVtxo {
-            outpoint,
-            amount: Amount::from_sat(escrow_amount_sats),
-        };
-
         let buyer_dest: ark_core::ArkAddress = buyer_dest_address.parse().map_err(to_magnus_err)?;
         let fee_outputs = parse_fee_outputs(fee_outputs)?;
         let signer_set = parse_signer_set(&signer_set)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
-        let release = spend::build_release_tx(
-            &contract.inner,
-            &escrow_vtxo,
-            &buyer_dest,
-            &fee_outputs,
-            signer_set,
-            &info,
-        )
-        .map_err(to_magnus_err)?;
+        let release = self
+            .rt
+            .block_on(client.build_release_for_outpoint(
+                &contract.inner,
+                outpoint,
+                &buyer_dest,
+                &fee_outputs,
+                signer_set,
+            ))
+            .map_err(to_magnus_err)?;
 
         let ark_tx_b64 = psbt_to_base64(&release.ark_tx);
         let checkpoints_b64: Vec<String> =
@@ -715,33 +704,25 @@ impl RbClient {
         &self,
         contract: &RbContract,
         escrow_outpoint: String,
-        escrow_amount_sats: u64,
+        _escrow_amount_sats: u64,
         seller_dest_address: String,
         signer_set: String,
     ) -> Result<(String, Vec<String>), Error> {
-        let info = {
-            let client = self.inner.lock().map_err(to_magnus_err)?;
-            client.server_info().map_err(to_magnus_err)?.clone()
-        };
-
         let outpoint: bitcoin::OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
-        let escrow_vtxo = spend::EscrowVtxo {
-            outpoint,
-            amount: Amount::from_sat(escrow_amount_sats),
-        };
-
         let seller_dest: ark_core::ArkAddress =
             seller_dest_address.parse().map_err(to_magnus_err)?;
         let signer_set = parse_signer_set(&signer_set)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
-        let refund = spend::build_refund_tx(
-            &contract.inner,
-            &escrow_vtxo,
-            &seller_dest,
-            signer_set,
-            &info,
-        )
-        .map_err(to_magnus_err)?;
+        let refund = self
+            .rt
+            .block_on(client.build_refund_for_outpoint(
+                &contract.inner,
+                outpoint,
+                &seller_dest,
+                signer_set,
+            ))
+            .map_err(to_magnus_err)?;
 
         let ark_tx_b64 = psbt_to_base64(&refund.ark_tx);
         let checkpoints_b64: Vec<String> =

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -7,14 +8,14 @@ use ark_core::VtxoList;
 use ark_core::batch::Delegate;
 use ark_core::server::{self, GetVtxosRequest};
 use bitcoin::key::Keypair;
-use bitcoin::{OutPoint, Psbt, Txid};
+use bitcoin::{OutPoint, Psbt, ScriptBuf, Txid, XOnlyPublicKey};
 use rand::rngs::OsRng;
 
 use crate::FeeOutput;
 use crate::contract::{EscrowContract, SignerSet};
 #[allow(deprecated)]
 use crate::delegate::DelegateVtxo;
-use crate::refresh::{RefreshIntent, RefreshVtxo};
+use crate::refresh::{RefreshInput, RefreshIntent, RefreshVtxo};
 use crate::spend::{self, EscrowVtxo};
 use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
 
@@ -29,19 +30,43 @@ pub struct EscrowVtxoStatus {
     pub is_swept: bool,
 }
 
+struct ResolvedEscrowVtxo {
+    contract: EscrowContract,
+    vtxo: EscrowVtxo,
+}
+
+struct ResolvedRefreshVtxo {
+    contract: EscrowContract,
+    vtxo: RefreshVtxo,
+}
+
 /// Wraps an `ark_grpc::Client` with escrow-specific helpers.
 #[derive(Clone)]
 pub struct EscrowClient {
     grpc: ark_grpc::Client,
-    server_info: Option<server::Info>,
+    server_info: Arc<RwLock<Option<server::Info>>>,
     timeout: Option<Duration>,
 }
 
 impl EscrowClient {
     pub fn new(url: &str) -> Self {
+        let server_info = Arc::new(RwLock::new(None));
+        let mut grpc = ark_grpc::Client::new(url.to_string());
+
+        let hook_server_info = server_info.clone();
+        grpc.set_info_refresh_hook(move |info| {
+            let mut guard = hook_server_info.write().map_err(
+                |_| -> Box<dyn std::error::Error + Send + Sync> {
+                    "server info cache lock poisoned".into()
+                },
+            )?;
+            *guard = Some(info);
+            Ok(())
+        });
+
         Self {
-            grpc: ark_grpc::Client::new(url.to_string()),
-            server_info: None,
+            grpc,
+            server_info,
             timeout: None,
         }
     }
@@ -63,7 +88,7 @@ impl EscrowClient {
     }
 
     /// Connect to the Arkade server and fetch server info.
-    pub async fn connect(&mut self) -> Result<&server::Info> {
+    pub async fn connect(&mut self) -> Result<server::Info> {
         // Ensure a TLS crypto provider is installed (needed for https:// URLs)
         let _ = rustls::crypto::ring::default_provider().install_default();
         Self::run_with_timeout(self.timeout, "connecting to Arkade", self.grpc.connect())
@@ -73,13 +98,15 @@ impl EscrowClient {
             Self::run_with_timeout(self.timeout, "getting server info", self.grpc.get_info())
                 .await
                 .context("getting server info")?;
-        self.server_info = Some(info);
-        Ok(self.server_info.as_ref().unwrap())
+        self.store_server_info(info.clone())?;
+        Ok(info)
     }
 
-    pub fn server_info(&self) -> Result<&server::Info> {
+    pub fn server_info(&self) -> Result<server::Info> {
         self.server_info
-            .as_ref()
+            .read()
+            .map_err(|_| anyhow::anyhow!("server info cache lock poisoned"))?
+            .clone()
             .context("not connected — call connect() first")
     }
 
@@ -102,16 +129,7 @@ impl EscrowClient {
         &self,
         contract: &EscrowContract,
     ) -> Result<Vec<EscrowVtxo>> {
-        let info = self.server_info()?;
-        let address = contract.address();
-
-        let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
-        let response =
-            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
-                .await
-                .context("listing VTXOs")?;
-
-        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+        let (_, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
 
         Ok(vtxo_list
             .spendable_offchain()
@@ -127,16 +145,7 @@ impl EscrowClient {
         &self,
         contract: &EscrowContract,
     ) -> Result<Vec<EscrowVtxoStatus>> {
-        let info = self.server_info()?;
-        let address = contract.address();
-
-        let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
-        let response =
-            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
-                .await
-                .context("listing VTXOs")?;
-
-        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+        let (_, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
 
         Ok(vtxo_list
             .spendable_offchain()
@@ -186,19 +195,17 @@ impl EscrowClient {
         fee_outputs: &[FeeOutput],
         signer_set: SignerSet,
     ) -> Result<spend::EscrowTransaction> {
-        let escrow_vtxo = self
-            .find_spendable_escrow_vtxo_by_outpoint(contract, outpoint)
-            .await?
-            .with_context(|| format!("spendable escrow VTXO not found: {outpoint}"))?;
-        let info = self.server_info()?;
+        let (info, resolved) = self
+            .resolve_spendable_escrow_vtxo(contract, outpoint)
+            .await?;
 
         spend::build_release_tx(
-            contract,
-            &escrow_vtxo,
+            &resolved.contract,
+            &resolved.vtxo,
             buyer_dest,
             fee_outputs,
             signer_set,
-            info,
+            &info,
         )
     }
 
@@ -213,13 +220,17 @@ impl EscrowClient {
         seller_dest: &ark_core::ArkAddress,
         signer_set: SignerSet,
     ) -> Result<spend::EscrowTransaction> {
-        let escrow_vtxo = self
-            .find_spendable_escrow_vtxo_by_outpoint(contract, outpoint)
-            .await?
-            .with_context(|| format!("spendable escrow VTXO not found: {outpoint}"))?;
-        let info = self.server_info()?;
+        let (info, resolved) = self
+            .resolve_spendable_escrow_vtxo(contract, outpoint)
+            .await?;
 
-        spend::build_refund_tx(contract, &escrow_vtxo, seller_dest, signer_set, info)
+        spend::build_refund_tx(
+            &resolved.contract,
+            &resolved.vtxo,
+            seller_dest,
+            signer_set,
+            &info,
+        )
     }
 
     /// Find all unspent escrow VTXOs and report whether any are recoverable.
@@ -231,16 +242,7 @@ impl EscrowClient {
         &self,
         contract: &EscrowContract,
     ) -> Result<(Vec<RefreshVtxo>, bool)> {
-        let info = self.server_info()?;
-        let address = contract.address();
-
-        let request = GetVtxosRequest::new_for_addresses(std::iter::once(address));
-        let response =
-            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
-                .await
-                .context("listing VTXOs")?;
-
-        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+        let (_, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
 
         let mut vtxos = Vec::new();
         let mut any_recoverable = false;
@@ -287,6 +289,32 @@ impl EscrowClient {
         ))
     }
 
+    /// Prepare a refresh intent, resolving old/current server signer contracts automatically.
+    pub async fn prepare_refresh(
+        &self,
+        contract: &EscrowContract,
+        vtxos: &[RefreshVtxo],
+        signer_set: SignerSet,
+        refresh_cosigner_pk: bitcoin::secp256k1::PublicKey,
+    ) -> Result<RefreshIntent> {
+        let (info, resolved_vtxos) = self.resolve_refresh_vtxos(contract, vtxos).await?;
+        let inputs = resolved_vtxos
+            .iter()
+            .map(|resolved| RefreshInput {
+                contract: &resolved.contract,
+                vtxo: &resolved.vtxo,
+            })
+            .collect::<Vec<_>>();
+
+        crate::refresh::prepare_refresh_resolved(
+            contract,
+            &inputs,
+            signer_set,
+            refresh_cosigner_pk,
+            &info,
+        )
+    }
+
     /// Execute a refresh via the Arkade batch ceremony.
     ///
     /// The `refresh` must contain fully-signed intent + forfeit PSBTs (signed
@@ -308,7 +336,7 @@ impl EscrowClient {
             "refreshing escrow",
             crate::refresh::execute_refresh(
                 &self.grpc,
-                info,
+                &info,
                 &mut rng,
                 refresh,
                 refresh_cosigner_kp,
@@ -332,7 +360,7 @@ impl EscrowClient {
         Self::run_with_timeout(
             self.timeout,
             "settling delegate",
-            crate::delegate::settle_delegate(&self.grpc, info, &mut rng, delegate, cosigner_kp),
+            crate::delegate::settle_delegate(&self.grpc, &info, &mut rng, delegate, cosigner_kp),
         )
         .await
     }
@@ -445,6 +473,127 @@ impl EscrowClient {
     }
 
     // --- Internal helpers ---
+
+    fn store_server_info(&self, info: server::Info) -> Result<()> {
+        *self
+            .server_info
+            .write()
+            .map_err(|_| anyhow::anyhow!("server info cache lock poisoned"))? = Some(info);
+        Ok(())
+    }
+
+    fn candidate_contracts(
+        contract: &EscrowContract,
+        info: &server::Info,
+    ) -> Result<Vec<EscrowContract>> {
+        let mut server_keys = Vec::<XOnlyPublicKey>::new();
+        let mut push_unique = |server: XOnlyPublicKey| {
+            if !server_keys.contains(&server) {
+                server_keys.push(server);
+            }
+        };
+
+        push_unique(contract.options().server);
+        push_unique(info.signer_pk.into());
+        for deprecated in &info.deprecated_signers {
+            push_unique(deprecated.pk.into());
+        }
+
+        server_keys
+            .into_iter()
+            .map(|server| contract.with_server(server))
+            .collect()
+    }
+
+    async fn list_candidate_vtxos(
+        &self,
+        contract: &EscrowContract,
+    ) -> Result<(server::Info, Vec<EscrowContract>, VtxoList)> {
+        let info = self.server_info()?;
+        let candidates = Self::candidate_contracts(contract, &info)?;
+        let request =
+            GetVtxosRequest::new_for_addresses(candidates.iter().map(EscrowContract::address));
+
+        let response =
+            Self::run_with_timeout(self.timeout, "listing VTXOs", self.grpc.list_vtxos(request))
+                .await
+                .context("listing VTXOs")?;
+
+        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+        Ok((info, candidates, vtxo_list))
+    }
+
+    fn contract_for_script(
+        candidates: &[EscrowContract],
+        script: &ScriptBuf,
+    ) -> Result<EscrowContract> {
+        candidates
+            .iter()
+            .find(|contract| contract.script_pubkey() == *script)
+            .cloned()
+            .with_context(|| format!("escrow contract not found for script pubkey {script}"))
+    }
+
+    async fn resolve_spendable_escrow_vtxo(
+        &self,
+        contract: &EscrowContract,
+        outpoint: OutPoint,
+    ) -> Result<(server::Info, ResolvedEscrowVtxo)> {
+        let (info, candidates, vtxo_list) = self.list_candidate_vtxos(contract).await?;
+        let vtxo = vtxo_list
+            .spendable_offchain()
+            .find(|v| v.outpoint == outpoint)
+            .with_context(|| format!("spendable escrow VTXO not found: {outpoint}"))?;
+        let contract = Self::contract_for_script(&candidates, &vtxo.script)?;
+
+        Ok((
+            info,
+            ResolvedEscrowVtxo {
+                contract,
+                vtxo: EscrowVtxo {
+                    outpoint: vtxo.outpoint,
+                    amount: vtxo.amount,
+                },
+            },
+        ))
+    }
+
+    async fn resolve_refresh_vtxos(
+        &self,
+        contract: &EscrowContract,
+        vtxos: &[RefreshVtxo],
+    ) -> Result<(server::Info, Vec<ResolvedRefreshVtxo>)> {
+        let (info, candidates, vtxo_list) = self.list_candidate_vtxos(contract).await?;
+        let all_unspent = vtxo_list.all_unspent().collect::<Vec<_>>();
+
+        let resolved = vtxos
+            .iter()
+            .map(|requested| {
+                let vtxo = all_unspent
+                    .iter()
+                    .copied()
+                    .find(|v| v.outpoint == requested.outpoint)
+                    .with_context(|| {
+                        format!(
+                            "escrow VTXO not found across signer candidates: {}",
+                            requested.outpoint
+                        )
+                    })?;
+                let contract = Self::contract_for_script(&candidates, &vtxo.script)?;
+
+                Ok(ResolvedRefreshVtxo {
+                    contract,
+                    vtxo: RefreshVtxo {
+                        outpoint: vtxo.outpoint,
+                        amount: vtxo.amount,
+                        is_swept: vtxo.is_swept,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((info, resolved))
+    }
 
     /// Submit a signed ark_tx + unsigned checkpoint PSBTs to the Arkade server.
     ///

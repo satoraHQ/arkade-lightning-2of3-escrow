@@ -100,6 +100,7 @@ impl EscrowOptions {
 }
 
 /// The escrow contract: wraps options + computed taproot spend info.
+#[derive(Clone)]
 pub struct EscrowContract {
     options: EscrowOptions,
     spend_info: TaprootSpendInfo,
@@ -123,6 +124,12 @@ impl EscrowContract {
 
     pub fn spend_info(&self) -> &TaprootSpendInfo {
         &self.spend_info
+    }
+
+    pub(crate) fn with_server(&self, server: XOnlyPublicKey) -> Result<Self> {
+        let mut options = self.options.clone();
+        options.server = server;
+        Self::new(options, self.network)
     }
 
     pub fn script_pubkey(&self) -> ScriptBuf {
