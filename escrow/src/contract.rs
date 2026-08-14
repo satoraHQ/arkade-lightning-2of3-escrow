@@ -60,6 +60,9 @@ impl EscrowOptions {
         if delay == 0 {
             bail!("unilateral_exit_delay must be non-zero");
         }
+        if !self.unilateral_exit_delay.is_relative_lock_time() {
+            bail!("unilateral_exit_delay must be a BIP68 relative lock-time");
+        }
 
         Ok(())
     }
@@ -356,5 +359,106 @@ mod tests {
             unilateral_exit_delay: bitcoin::Sequence(0),
         };
         assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_disabled_relative_locktime() {
+        let secp = Secp256k1::new();
+        let mut rng = bitcoin::secp256k1::rand::thread_rng();
+
+        // 0xFFFFFFFF has the BIP68 disable flag set, so it is not a relative
+        // lock-time even though it is non-zero.
+        let opts = EscrowOptions {
+            seller: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            buyer: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            arbiter: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            server: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            unilateral_exit_delay: bitcoin::Sequence(0xFFFFFFFF),
+        };
+        assert!(opts.validate().is_err());
+    }
+
+    fn random_options_with_delay(delay: bitcoin::Sequence) -> EscrowOptions {
+        let secp = Secp256k1::new();
+        let mut rng = bitcoin::secp256k1::rand::thread_rng();
+        EscrowOptions {
+            seller: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            buyer: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            arbiter: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            server: Keypair::new(&secp, &mut rng).x_only_public_key().0,
+            unilateral_exit_delay: delay,
+        }
+    }
+
+    #[test]
+    fn consensus_sequence_roundtrips_for_seconds_delay() {
+        // The Ark server advertises a seconds-based delay encoded as a BIP68
+        // consensus u32. Feeding that raw u32 into `bitcoin::Sequence` must
+        // produce the same escrow address as the original `Sequence`.
+        let opts = random_options_with_delay(
+            bitcoin::Sequence::from_seconds_ceil(512).unwrap(),
+        );
+        let consensus = opts.unilateral_exit_delay.to_consensus_u32();
+
+        let expected = EscrowContract::new(opts.clone(), Network::Regtest)
+            .unwrap()
+            .address()
+            .to_string();
+        let mut from_server = opts;
+        from_server.unilateral_exit_delay = bitcoin::Sequence(consensus);
+        let from_server = EscrowContract::new(from_server, Network::Regtest)
+            .unwrap()
+            .address()
+            .to_string();
+
+        assert_eq!(from_server, expected);
+    }
+
+    #[test]
+    fn consensus_sequence_roundtrips_for_block_delay() {
+        // Same check for a block-based delay.
+        let opts = random_options_with_delay(bitcoin::Sequence::from_height(1000));
+        let consensus = opts.unilateral_exit_delay.to_consensus_u32();
+
+        let expected = EscrowContract::new(opts.clone(), Network::Regtest)
+            .unwrap()
+            .address()
+            .to_string();
+        let mut from_server = opts;
+        from_server.unilateral_exit_delay = bitcoin::Sequence(consensus);
+        let from_server = EscrowContract::new(from_server, Network::Regtest)
+            .unwrap()
+            .address()
+            .to_string();
+
+        assert_eq!(from_server, expected);
+    }
+
+    #[test]
+    fn reinterpreting_consensus_seconds_as_raw_seconds_changes_address() {
+        // This is the bug that used to live in the Ruby FFI layer: the raw
+        // consensus u32 for a 512-second delay (0x00400001) was passed to
+        // `Sequence::from_seconds_ceil` again, treating the flagged value as a
+        // plain second count. The resulting address must differ from the
+        // correct one.
+        let correct_opts = random_options_with_delay(
+            bitcoin::Sequence::from_seconds_ceil(512).unwrap(),
+        );
+        let consensus = correct_opts.unilateral_exit_delay.to_consensus_u32();
+
+        let correct = EscrowContract::new(correct_opts.clone(), Network::Regtest)
+            .unwrap()
+            .address()
+            .to_string();
+
+        let mut wrong_opts = correct_opts;
+        wrong_opts.unilateral_exit_delay =
+            bitcoin::Sequence::from_seconds_ceil(consensus).unwrap();
+        let wrong = EscrowContract::new(wrong_opts, Network::Regtest)
+            .unwrap()
+            .address()
+            .to_string();
+
+        assert_ne!(correct, wrong);
     }
 }
