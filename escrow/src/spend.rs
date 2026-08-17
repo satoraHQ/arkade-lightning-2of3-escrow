@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use ark_core::send::{self, OffchainTransactions, SendReceiver, VtxoInput};
 use ark_core::server;
 use bitcoin::key::Keypair;
-use bitcoin::secp256k1::{self, Secp256k1, schnorr};
+use bitcoin::secp256k1::{self, schnorr, Secp256k1};
 use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 
 use crate::contract::{EscrowContract, SignerSet};
-use crate::{FeeOutput, ReleaseMode, plan_release};
+use crate::{plan_release, FeeOutput, ReleaseMode};
 
 /// Everything needed to describe an escrow VTXO that will be spent.
 pub struct EscrowVtxo {
@@ -183,13 +183,97 @@ pub fn sign_checkpoint(psbt: &mut Psbt, keypair: &Keypair) -> Result<()> {
 /// Takes the base PSBT (with one party's sigs) and merges sigs from another
 /// copy. Both PSBTs must have the same unsigned tx.
 pub fn merge_ark_tx_sigs(base: &mut Psbt, other: &Psbt) -> Result<()> {
-    for (i, other_input) in other.inputs.iter().enumerate() {
+    anyhow::ensure!(
+        base.unsigned_tx == other.unsigned_tx,
+        "refusing to merge signatures: unsigned transactions differ",
+    );
+    anyhow::ensure!(
+        base.inputs.len() == other.inputs.len(),
+        "refusing to merge signatures: input counts differ (base {}, other {})",
+        base.inputs.len(),
+        other.inputs.len(),
+    );
+
+    for (base_input, other_input) in base.inputs.iter_mut().zip(&other.inputs) {
         for (key, sig) in &other_input.tap_script_sigs {
-            base.inputs[i]
+            base_input
                 .tap_script_sigs
                 .entry(*key)
                 .or_insert_with(|| *sig);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute;
+    use bitcoin::blockdata::transaction::Version;
+    use bitcoin::sighash::TapSighashType;
+    use bitcoin::taproot::{LeafVersion, TapLeafHash};
+    use bitcoin::{taproot, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    fn psbt_with_inputs(input_count: usize) -> Psbt {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                };
+                input_count
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    fn add_tap_script_sig(psbt: &mut Psbt, input_index: usize) {
+        let pk: XOnlyPublicKey = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap();
+        let leaf_hash =
+            TapLeafHash::from_script(ScriptBuf::new().as_script(), LeafVersion::TapScript);
+        let sig = taproot::Signature {
+            signature: schnorr::Signature::from_slice(&[4; 64]).unwrap(),
+            sighash_type: TapSighashType::Default,
+        };
+        psbt.inputs[input_index]
+            .tap_script_sigs
+            .insert((pk, leaf_hash), sig);
+    }
+
+    #[test]
+    fn merge_rejects_different_unsigned_transactions() {
+        let mut base = psbt_with_inputs(1);
+        let mut other = psbt_with_inputs(2);
+        add_tap_script_sig(&mut other, 1);
+
+        let err = merge_ark_tx_sigs(&mut base, &other)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unsigned transactions differ"));
+    }
+
+    #[test]
+    fn merge_copies_tap_script_sigs_for_same_transaction() {
+        let mut base = psbt_with_inputs(1);
+        let mut other = base.clone();
+        add_tap_script_sig(&mut other, 0);
+
+        merge_ark_tx_sigs(&mut base, &other).unwrap();
+
+        assert_eq!(
+            base.inputs[0].tap_script_sigs,
+            other.inputs[0].tap_script_sigs
+        );
+    }
 }
