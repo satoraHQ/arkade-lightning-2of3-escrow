@@ -29,7 +29,7 @@ use ark_core::server::{self, BatchTreeEventType, PartialSigTree, StreamEvent};
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
-use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, XOnlyPublicKey};
+use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
 
 use crate::contract::{EscrowContract, SignerSet};
@@ -162,6 +162,8 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
         "cosigner keypair does not match delegate_cosigner_pk",
     );
 
+    let vtxo_input_outpoints = forfeit_input_outpoints(&delegate.forfeit_psbts)?;
+
     // Register the pre-signed intent.
     let intent_id = grpc
         .register_intent(delegate.intent.clone())
@@ -175,12 +177,6 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
 
     let own_cosigner_kps = [cosigner_kp];
     let own_cosigner_pks: Vec<_> = own_cosigner_kps.iter().map(|k| k.public_key()).collect();
-
-    let vtxo_input_outpoints: Vec<_> = delegate
-        .forfeit_psbts
-        .iter()
-        .map(|psbt| psbt.unsigned_tx.input[0].previous_output)
-        .collect();
 
     let topics = vtxo_input_outpoints
         .iter()
@@ -303,17 +299,17 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
                         }
                     }
 
+                    let vg = vtxo_graph
+                        .as_ref()
+                        .context("signing started without VTXO graph")?;
+
                     let mut nonce_map = HashMap::new();
                     for kp in &own_cosigner_kps {
                         let pk = kp.public_key();
-                        let nonce_tree = generate_nonce_tree(
-                            rng,
-                            vtxo_graph.as_ref().unwrap(),
-                            pk,
-                            &e.unsigned_commitment_tx,
-                        )
-                        .map_err(|e| anyhow::anyhow!("{e:#}"))
-                        .context("generating nonce tree")?;
+                        let nonce_tree =
+                            generate_nonce_tree(rng, vg, pk, &e.unsigned_commitment_tx)
+                                .map_err(|e| anyhow::anyhow!("{e:#}"))
+                                .context("generating nonce tree")?;
 
                         grpc.submit_tree_nonces(&e.id, pk, nonce_tree.to_nonce_pks())
                             .await
@@ -448,6 +444,20 @@ pub async fn settle_delegate<R: Rng + CryptoRng>(
     }
 }
 
+fn forfeit_input_outpoints(forfeit_psbts: &[Psbt]) -> Result<Vec<OutPoint>> {
+    forfeit_psbts
+        .iter()
+        .enumerate()
+        .map(|(i, psbt)| {
+            psbt.unsigned_tx
+                .input
+                .first()
+                .map(|input| input.previous_output)
+                .with_context(|| format!("forfeit PSBT {i} has no inputs"))
+        })
+        .collect()
+}
+
 #[allow(deprecated)]
 fn build_intent_inputs(
     vtxos: &[DelegateVtxo],
@@ -475,4 +485,30 @@ fn build_intent_inputs(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute;
+    use bitcoin::blockdata::transaction::Version;
+    use bitcoin::{Psbt, ScriptBuf, Transaction, TxOut};
+
+    #[test]
+    fn forfeit_input_outpoints_rejects_zero_input_psbt() {
+        let psbt = Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap();
+
+        let err = forfeit_input_outpoints(&[psbt]).unwrap_err().to_string();
+
+        assert!(err.contains("forfeit PSBT 0 has no inputs"));
+    }
 }
