@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use ark_core::send::{self, OffchainTransactions, SendReceiver, VtxoInput};
 use ark_core::server;
 use bitcoin::key::Keypair;
-use bitcoin::secp256k1::{self, schnorr, Secp256k1};
+use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 
 use crate::contract::{EscrowContract, SignerSet};
-use crate::{plan_release, FeeOutput, ReleaseMode};
+use crate::{FeeOutput, ReleaseMode, plan_release};
 
 /// Everything needed to describe an escrow VTXO that will be spent.
 pub struct EscrowVtxo {
@@ -212,7 +212,7 @@ mod tests {
     use bitcoin::blockdata::transaction::Version;
     use bitcoin::sighash::TapSighashType;
     use bitcoin::taproot::{LeafVersion, TapLeafHash};
-    use bitcoin::{taproot, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use bitcoin::{ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, taproot};
 
     fn psbt_with_inputs(input_count: usize) -> Psbt {
         let tx = Transaction {

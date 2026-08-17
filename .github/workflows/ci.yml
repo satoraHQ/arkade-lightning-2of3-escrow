@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - run: just ci
