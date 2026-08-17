@@ -16,7 +16,7 @@
         };
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" ];
+          extensions = [ "clippy" "rust-src" "rustfmt" ];
         };
 
         rustfmt = (pkgs.rust-bin.selectLatestNightlyWith (t: t.minimal)).override {

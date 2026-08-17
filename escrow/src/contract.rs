@@ -395,9 +395,7 @@ mod tests {
         // The Ark server advertises a seconds-based delay encoded as a BIP68
         // consensus u32. Feeding that raw u32 into `bitcoin::Sequence` must
         // produce the same escrow address as the original `Sequence`.
-        let opts = random_options_with_delay(
-            bitcoin::Sequence::from_seconds_ceil(512).unwrap(),
-        );
+        let opts = random_options_with_delay(bitcoin::Sequence::from_seconds_ceil(512).unwrap());
         let consensus = opts.unilateral_exit_delay.to_consensus_u32();
 
         let expected = EscrowContract::new(opts.clone(), Network::Regtest)
@@ -441,9 +439,8 @@ mod tests {
         // `Sequence::from_seconds_ceil` again, treating the flagged value as a
         // plain second count. The resulting address must differ from the
         // correct one.
-        let correct_opts = random_options_with_delay(
-            bitcoin::Sequence::from_seconds_ceil(512).unwrap(),
-        );
+        let correct_opts =
+            random_options_with_delay(bitcoin::Sequence::from_seconds_ceil(512).unwrap());
         let consensus = correct_opts.unilateral_exit_delay.to_consensus_u32();
 
         let correct = EscrowContract::new(correct_opts.clone(), Network::Regtest)
@@ -452,8 +449,7 @@ mod tests {
             .to_string();
 
         let mut wrong_opts = correct_opts;
-        wrong_opts.unilateral_exit_delay =
-            bitcoin::Sequence::from_seconds_ceil(consensus).unwrap();
+        wrong_opts.unilateral_exit_delay = bitcoin::Sequence::from_seconds_ceil(consensus).unwrap();
         let wrong = EscrowContract::new(wrong_opts, Network::Regtest)
             .unwrap()
             .address()
