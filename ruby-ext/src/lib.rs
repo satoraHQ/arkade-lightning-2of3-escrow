@@ -182,14 +182,12 @@ impl RbContract {
             buyer: parse_xonly(&buyer_pk)?,
             arbiter: parse_xonly(&arbiter_pk)?,
             server: parse_xonly(&server_pk)?,
-            // Match Arkade's parse_sequence_number convention:
-            // values < 512 → block-based, values >= 512 → seconds-based
-            unilateral_exit_delay: if unilateral_exit_delay < 512 {
-                bitcoin::Sequence::from_height(unilateral_exit_delay as u16)
-            } else {
-                bitcoin::Sequence::from_seconds_ceil(unilateral_exit_delay)
-                    .map_err(to_magnus_err)?
-            },
+            // The value comes from the Ark server as a raw BIP68 consensus
+            // sequence (e.g. via `EscrowClient::unilateral_exit_delay`).
+            // Reinterpret it directly as a `bitcoin::Sequence` instead of
+            // re-applying the `parse_sequence_number` convention, which would
+            // double-encode the seconds flag and silently change the delay.
+            unilateral_exit_delay: bitcoin::Sequence::from_consensus(unilateral_exit_delay),
         };
         let net = parse_network(&network)?;
         let contract = EscrowContract::new(opts, net).map_err(to_magnus_err)?;

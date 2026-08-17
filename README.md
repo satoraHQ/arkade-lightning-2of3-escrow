@@ -111,7 +111,8 @@ client = ArkEscrow::Client.with_custom_store(
 client.set_timeout_ms(30_000)
 client.connect
 
-# Create contract
+# Create contract. `client.unilateral_exit_delay` is the raw BIP68 consensus
+# sequence from the Ark server; pass it through unchanged.
 contract = ArkEscrow::Contract.new(
   seller_pk, buyer_pk, arbiter_pk, client.server_pk,
   client.unilateral_exit_delay, "bitcoin"
