@@ -46,6 +46,7 @@ pub struct EscrowClient {
     grpc: ark_grpc::Client,
     server_info: Arc<RwLock<Option<server::Info>>>,
     timeout: Option<Duration>,
+    refresh_timeout: Option<Duration>,
 }
 
 impl EscrowClient {
@@ -68,6 +69,7 @@ impl EscrowClient {
             grpc,
             server_info,
             timeout: None,
+            refresh_timeout: Some(Duration::from_secs(120)),
         }
     }
 
@@ -77,14 +79,28 @@ impl EscrowClient {
         client
     }
 
-    /// Set the timeout applied to Arkade network operations. `None` disables
-    /// wrapper-level timeouts.
+    /// Set the timeout applied to Arkade network operations other than refresh.
+    /// `None` disables this timeout. Refresh has its own ceremony deadline; see
+    /// [`Self::set_refresh_timeout`].
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
     }
 
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// Set the overall deadline for a refresh batch ceremony (default: 120s).
+    /// This includes intent registration and waiting for batch events. Configure
+    /// it to accommodate the server's batch schedule and signing time.
+    /// `None` disables the refresh deadline. The ordinary request timeout is
+    /// independent and does not apply inside the ceremony.
+    pub fn set_refresh_timeout(&mut self, timeout: Option<Duration>) {
+        self.refresh_timeout = timeout;
+    }
+
+    pub fn refresh_timeout(&self) -> Option<Duration> {
+        self.refresh_timeout
     }
 
     /// Connect to the Arkade server and fetch server info.
@@ -322,7 +338,8 @@ impl EscrowClient {
     /// refresh cosigner keypair whose public key was committed in the intent.
     ///
     /// Blocks until the batch ceremony completes (~10-30s). Returns the
-    /// commitment transaction ID.
+    /// commitment transaction ID. Uses [`Self::refresh_timeout`] for the entire
+    /// ceremony, independently of [`Self::timeout`].
     pub async fn refresh_escrow(
         &self,
         refresh: RefreshIntent,
@@ -332,7 +349,7 @@ impl EscrowClient {
         let mut rng = OsRng;
 
         Self::run_with_timeout(
-            self.timeout,
+            self.refresh_timeout,
             "refreshing escrow",
             crate::refresh::execute_refresh(
                 &self.grpc,

@@ -105,10 +105,12 @@ require 'ark_escrow'
 
 # Connect to Arkade (with a custom crash-recovery store)
 client = ArkEscrow::Client.with_custom_store(
-  "https://arkade.computer:7070", my_store, timeout_ms: 30_000
+  "https://arkade.computer:7070", my_store,
+  timeout_ms: 3_000, refresh_timeout_ms: 120_000
 )
 # Optional: update later; use 0 to disable again.
-client.set_timeout_ms(30_000)
+client.set_timeout_ms(3_000)
+client.set_refresh_timeout_ms(120_000)
 client.connect
 
 # Create contract. `client.unilateral_exit_delay` is the raw BIP68 consensus
@@ -155,6 +157,17 @@ ark_txid = client.spend_escrow_offchain(
 ### Refreshing recoverable VTXOs
 
 When escrow VTXOs become recoverable, first refresh them back into the same escrow contract address. The refreshed escrow then becomes spendable again through the normal offchain signer-set flow. This avoids direct settlement outputs for fees/referrals, which may be sub-dust.
+
+Refresh uses a separate overall deadline, defaulting to 120 seconds, for intent
+registration and the complete batch ceremony. The ordinary request timeout does
+not apply inside refresh. Set the deadline to accommodate the server's batch
+schedule and signing time. In Rust, use `set_refresh_timeout(Some(Duration::from_secs(120)))`
+or `None` to disable it. In Ruby, both store constructors accept
+`refresh_timeout_ms:`, and `set_refresh_timeout_ms` changes it later; `0` disables
+it. Changing `timeout_ms` does not change the refresh deadline.
+
+A timeout stops the local wait; it does not cancel an intent already accepted by
+the server or prove that the batch failed.
 
 ```ruby
 # Check VTXO status

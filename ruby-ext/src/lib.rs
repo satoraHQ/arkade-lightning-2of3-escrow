@@ -230,13 +230,24 @@ impl RbClient {
     ///
     /// - `url`: Arkade gRPC URL.
     /// - `store_dir`: directory for persisting pending spends.
-    /// - `timeout_ms:` optional Arkade network-operation timeout in milliseconds.
+    /// - `timeout_ms:` optional ordinary network-operation timeout in milliseconds.
+    /// - `refresh_timeout_ms:` overall refresh deadline (default: 120_000ms).
+    ///   A value of 0 disables the corresponding timeout.
     fn with_file_store(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(String, String), (), (), (), _, ()>(args)?;
         let (url, store_dir) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<u64>,), ()>(args.keywords, &[], &["timeout_ms"])?;
-        let (timeout_ms,) = kwargs.optional;
-        Self::with_file_store_inner(url, store_dir, timeout_ms.and_then(timeout_from_ms))
+        let kwargs = get_kwargs::<_, (), (Option<u64>, Option<u64>), ()>(
+            args.keywords,
+            &[],
+            &["timeout_ms", "refresh_timeout_ms"],
+        )?;
+        let (timeout_ms, refresh_timeout_ms) = kwargs.optional;
+        Self::with_file_store_inner(
+            url,
+            store_dir,
+            timeout_ms.and_then(timeout_from_ms),
+            refresh_timeout_ms,
+        )
     }
 
     fn with_file_store_timeout(
@@ -244,18 +255,22 @@ impl RbClient {
         store_dir: String,
         timeout_ms: u64,
     ) -> Result<Self, Error> {
-        Self::with_file_store_inner(url, store_dir, timeout_from_ms(timeout_ms))
+        Self::with_file_store_inner(url, store_dir, timeout_from_ms(timeout_ms), None)
     }
 
     fn with_file_store_inner(
         url: String,
         store_dir: String,
         timeout: Option<Duration>,
+        refresh_timeout_ms: Option<u64>,
     ) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = FileSpendStore::new(&store_dir).map_err(to_magnus_err)?;
         let mut client = EscrowClient::new(&url);
         client.set_timeout(timeout);
+        if let Some(timeout_ms) = refresh_timeout_ms {
+            client.set_refresh_timeout(timeout_from_ms(timeout_ms));
+        }
         Ok(Self {
             inner: Mutex::new(client),
             store: Box::new(store),
@@ -265,6 +280,9 @@ impl RbClient {
     }
 
     /// Create a client with a custom Ruby store object for crash recovery.
+    ///
+    /// Accepts `timeout_ms:` and `refresh_timeout_ms:` as with `with_file_store`.
+    /// The refresh deadline defaults to 120_000ms; 0 disables it.
     ///
     /// The store object must respond to:
     /// - `save(id, json)` — persist a pending spend as JSON.
@@ -279,9 +297,18 @@ impl RbClient {
     fn with_custom_store(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(String, Value), (), (), (), _, ()>(args)?;
         let (url, rb_store) = args.required;
-        let kwargs = get_kwargs::<_, (), (Option<u64>,), ()>(args.keywords, &[], &["timeout_ms"])?;
-        let (timeout_ms,) = kwargs.optional;
-        Self::with_custom_store_inner(url, rb_store, timeout_ms.and_then(timeout_from_ms))
+        let kwargs = get_kwargs::<_, (), (Option<u64>, Option<u64>), ()>(
+            args.keywords,
+            &[],
+            &["timeout_ms", "refresh_timeout_ms"],
+        )?;
+        let (timeout_ms, refresh_timeout_ms) = kwargs.optional;
+        Self::with_custom_store_inner(
+            url,
+            rb_store,
+            timeout_ms.and_then(timeout_from_ms),
+            refresh_timeout_ms,
+        )
     }
 
     fn with_custom_store_timeout(
@@ -289,18 +316,22 @@ impl RbClient {
         rb_store: magnus::Value,
         timeout_ms: u64,
     ) -> Result<Self, Error> {
-        Self::with_custom_store_inner(url, rb_store, timeout_from_ms(timeout_ms))
+        Self::with_custom_store_inner(url, rb_store, timeout_from_ms(timeout_ms), None)
     }
 
     fn with_custom_store_inner(
         url: String,
         rb_store: magnus::Value,
         timeout: Option<Duration>,
+        refresh_timeout_ms: Option<u64>,
     ) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = CallbackSpendStore::new(rb_store);
         let mut client = EscrowClient::new(&url);
         client.set_timeout(timeout);
+        if let Some(timeout_ms) = refresh_timeout_ms {
+            client.set_refresh_timeout(timeout_from_ms(timeout_ms));
+        }
         Ok(Self {
             inner: Mutex::new(client),
             store: Box::new(store),
@@ -312,6 +343,12 @@ impl RbClient {
     fn set_timeout_ms(&self, timeout_ms: u64) -> Result<(), Error> {
         let mut client = self.inner.lock().map_err(to_magnus_err)?;
         client.set_timeout(timeout_from_ms(timeout_ms));
+        Ok(())
+    }
+
+    fn set_refresh_timeout_ms(&self, timeout_ms: u64) -> Result<(), Error> {
+        let mut client = self.inner.lock().map_err(to_magnus_err)?;
+        client.set_refresh_timeout(timeout_from_ms(timeout_ms));
         Ok(())
     }
 
@@ -953,6 +990,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         function!(RbClient::with_custom_store_timeout, 3),
     )?;
     client_class.define_method("set_timeout_ms", method!(RbClient::set_timeout_ms, 1))?;
+    client_class.define_method(
+        "set_refresh_timeout_ms",
+        method!(RbClient::set_refresh_timeout_ms, 1),
+    )?;
     client_class.define_method("connect", method!(RbClient::connect, 0))?;
     client_class.define_method("server_pk", method!(RbClient::server_pk, 0))?;
     client_class.define_method(
