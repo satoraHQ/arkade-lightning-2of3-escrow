@@ -203,11 +203,26 @@ impl RbContract {
 ///
 /// Uses a persistent tokio runtime so the gRPC connection stays alive
 /// across calls (a new runtime per call would invalidate the channel).
-#[magnus::wrap(class = "ArkEscrow::Client")]
+#[derive(magnus::TypedData)]
+#[magnus(class = "ArkEscrow::Client", mark)]
 struct RbClient {
     inner: Mutex<EscrowClient>,
     store: Box<dyn SpendStore + Send + Sync>,
+    /// GC anchor for the Ruby store object held by [`CallbackSpendStore`].
+    rb_store: Option<Opaque<Value>>,
     rt: Runtime,
+}
+
+impl magnus::DataTypeFunctions for RbClient {
+    fn mark(&self, marker: &magnus::gc::Marker) {
+        // `#[magnus::wrap]` derives an empty `mark`, which leaves the store
+        // invisible to the GC: once the Ruby caller drops its reference the
+        // object is collected (or moved by a compactor) while
+        // `CallbackSpendStore` still holds its `VALUE`.
+        if let Some(rb_store) = self.rb_store {
+            marker.mark(rb_store);
+        }
+    }
 }
 
 impl RbClient {
@@ -244,6 +259,7 @@ impl RbClient {
         Ok(Self {
             inner: Mutex::new(client),
             store: Box::new(store),
+            rb_store: None,
             rt,
         })
     }
@@ -288,6 +304,7 @@ impl RbClient {
         Ok(Self {
             inner: Mutex::new(client),
             store: Box::new(store),
+            rb_store: Some(Opaque::from(rb_store)),
             rt,
         })
     }
