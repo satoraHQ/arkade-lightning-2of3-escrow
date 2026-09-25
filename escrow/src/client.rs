@@ -482,10 +482,17 @@ impl EscrowClient {
         Ok(())
     }
 
+    /// Build one candidate contract per known server key.
+    ///
+    /// A server key that collides with one of the escrow parties cannot form a
+    /// valid contract, so it is skipped rather than failing the whole lookup.
+    /// The contract's own server key is always first and always valid, so the
+    /// result is never empty.
     fn candidate_contracts(
         contract: &EscrowContract,
-        info: &server::Info,
-    ) -> Result<Vec<EscrowContract>> {
+        signer_pk: XOnlyPublicKey,
+        deprecated_signers: &[server::DeprecatedSigner],
+    ) -> Vec<EscrowContract> {
         let mut server_keys = Vec::<XOnlyPublicKey>::new();
         let mut push_unique = |server: XOnlyPublicKey| {
             if !server_keys.contains(&server) {
@@ -494,14 +501,20 @@ impl EscrowClient {
         };
 
         push_unique(contract.options().server);
-        push_unique(info.signer_pk.into());
-        for deprecated in &info.deprecated_signers {
+        push_unique(signer_pk);
+        for deprecated in deprecated_signers {
             push_unique(deprecated.pk.into());
         }
 
         server_keys
             .into_iter()
-            .map(|server| contract.with_server(server))
+            .filter_map(|server| match contract.with_server(server) {
+                Ok(candidate) => Some(candidate),
+                Err(e) => {
+                    tracing::warn!(%server, "Skipping server key that cannot form an escrow contract: {e:#}");
+                    None
+                }
+            })
             .collect()
     }
 
@@ -510,7 +523,8 @@ impl EscrowClient {
         contract: &EscrowContract,
     ) -> Result<(server::Info, Vec<EscrowContract>, VtxoList)> {
         let info = self.server_info()?;
-        let candidates = Self::candidate_contracts(contract, &info)?;
+        let candidates =
+            Self::candidate_contracts(contract, info.signer_pk.into(), &info.deprecated_signers);
         let request =
             GetVtxosRequest::new_for_addresses(candidates.iter().map(EscrowContract::address));
 
@@ -704,5 +718,80 @@ impl EscrowClient {
                 Ok(merged)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contract::EscrowOptions;
+    use bitcoin::Network;
+    use bitcoin::secp256k1::{Secp256k1, rand};
+
+    fn deprecated_signer(pk: bitcoin::secp256k1::PublicKey) -> server::DeprecatedSigner {
+        server::DeprecatedSigner { pk, cutoff_date: 0 }
+    }
+
+    #[test]
+    fn candidates_skip_a_deprecated_signer_colliding_with_an_escrow_party() {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let seller = Keypair::new(&secp, &mut rng);
+        let buyer = Keypair::new(&secp, &mut rng);
+        let arbiter = Keypair::new(&secp, &mut rng);
+        let signer = Keypair::new(&secp, &mut rng);
+
+        let contract = EscrowContract::new(
+            EscrowOptions {
+                seller: seller.x_only_public_key().0,
+                buyer: buyer.x_only_public_key().0,
+                arbiter: arbiter.x_only_public_key().0,
+                server: signer.x_only_public_key().0,
+                unilateral_exit_delay: bitcoin::Sequence(512),
+            },
+            Network::Regtest,
+        )
+        .unwrap();
+
+        // The buyer picked a key the server advertises as a deprecated signer.
+        let candidates = EscrowClient::candidate_contracts(
+            &contract,
+            signer.x_only_public_key().0,
+            &[deprecated_signer(buyer.public_key())],
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].script_pubkey(), contract.script_pubkey());
+    }
+
+    #[test]
+    fn candidates_cover_every_collision_free_server_key() {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let seller = Keypair::new(&secp, &mut rng);
+        let buyer = Keypair::new(&secp, &mut rng);
+        let arbiter = Keypair::new(&secp, &mut rng);
+        let signer = Keypair::new(&secp, &mut rng);
+        let old_signer = Keypair::new(&secp, &mut rng);
+
+        let contract = EscrowContract::new(
+            EscrowOptions {
+                seller: seller.x_only_public_key().0,
+                buyer: buyer.x_only_public_key().0,
+                arbiter: arbiter.x_only_public_key().0,
+                server: signer.x_only_public_key().0,
+                unilateral_exit_delay: bitcoin::Sequence(512),
+            },
+            Network::Regtest,
+        )
+        .unwrap();
+
+        let candidates = EscrowClient::candidate_contracts(
+            &contract,
+            signer.x_only_public_key().0,
+            &[deprecated_signer(old_signer.public_key())],
+        );
+
+        assert_eq!(candidates.len(), 2);
     }
 }
