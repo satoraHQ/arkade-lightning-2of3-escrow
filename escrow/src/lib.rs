@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use bitcoin::Amount;
 
 pub mod client;
@@ -44,10 +44,38 @@ pub fn plan_release(
         format!("fee exceeds amount locked up in escrow contract: {total_fee} > {total_escrow_amount}")
     })?;
 
+    ensure!(
+        buyer_amount >= dust,
+        "server dust ({dust}) exceeds buyer payout ({buyer_amount})",
+    );
+
     Ok(ReleasePlan {
         total_escrow_amount,
         buyer_amount,
         effective_fee_outputs,
         discarded_fee_outputs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DUST: Amount = Amount::from_sat(330);
+
+    #[test]
+    fn plan_release_rejects_sub_dust_buyer_payout() {
+        let err = plan_release(Amount::from_sat(300), &[], ReleaseMode::Offchain, DUST)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("exceeds buyer payout"), "{err}");
+    }
+
+    #[test]
+    fn plan_release_accepts_buyer_payout_at_dust() {
+        let plan = plan_release(DUST, &[], ReleaseMode::Offchain, DUST).unwrap();
+
+        assert_eq!(plan.buyer_amount, DUST);
+    }
 }
