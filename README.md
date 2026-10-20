@@ -240,10 +240,15 @@ A custom store must:
 - Make `save(id, json)` durable before returning. The file store fsyncs.
 - Return the latest JSON from `load(id)`, or `nil`.
 - Optionally implement `remove_if(id, token) -> bool` as a single
-  compare-and-delete (`DELETE ... WHERE id = ? AND (token = ? OR token IS NULL)`).
-  Without it the gem falls back to `load`, compare, `remove`, which is not atomic
+  compare-and-delete (`DELETE ... WHERE id = ? AND (token = ? OR token IS NULL)`)
+  and `save_if(id, json, token) -> bool` as a single compare-and-overwrite.
+  Without them the gem falls back to `load`, compare, write, which is not atomic
   and only protects against a concurrent attempt if the two calls are otherwise
   serialised (e.g. by a row lock).
+- Treat an `id` as bound to one ark transaction for good. Supplying a different
+  transaction under an `id` that has a record is an error.
+- Do not downgrade the gem while `finalized` records exist: older versions do
+  not know that stage value and fail to read such records.
 - Records written by older gem versions have no `stage` or `token`; they load as
   `submitted` and match any token, but see above: without `server_signed_ark_tx`
   they are not finalized automatically.

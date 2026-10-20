@@ -156,6 +156,25 @@ pub trait SpendStore {
             _ => Ok(false),
         }
     }
+
+    /// Overwrite the record for `spend.id` only if the stored record's token
+    /// equals `spend.token` (or is empty). Returns whether it was written.
+    ///
+    /// Used to mark a spend finalized without clobbering a record another
+    /// attempt wrote in the meantime. Same atomicity caveat and override
+    /// advice as [`remove_if`] (e.g. `UPDATE ... WHERE id = ? AND (token = ?
+    /// OR token IS NULL)`).
+    ///
+    /// [`remove_if`]: SpendStore::remove_if
+    fn save_if(&self, spend: &PendingSpend) -> Result<bool> {
+        match self.load(&spend.id)? {
+            Some(existing) if existing.token.is_empty() || existing.token == spend.token => {
+                self.save(spend)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 /// File-based [`SpendStore`]: one JSON file per pending spend in a directory.
@@ -315,6 +334,32 @@ mod tests {
         // Removing an absent record is not an error.
         assert!(!store.remove_if("trade-1", "second").unwrap());
         store.remove("trade-1").unwrap();
+    }
+
+    #[test]
+    fn save_if_only_overwrites_a_record_with_the_same_token() {
+        let store = temp_store();
+        store.save(&record("trade-1", "first")).unwrap();
+
+        let mut finalized_by_second = record("trade-1", "second");
+        finalized_by_second.stage = SpendStage::Finalized;
+        assert!(!store.save_if(&finalized_by_second).unwrap());
+        assert_eq!(
+            store.load("trade-1").unwrap().unwrap().stage,
+            SpendStage::Submitting
+        );
+
+        let mut finalized_by_first = record("trade-1", "first");
+        finalized_by_first.stage = SpendStage::Finalized;
+        assert!(store.save_if(&finalized_by_first).unwrap());
+        assert_eq!(
+            store.load("trade-1").unwrap().unwrap().stage,
+            SpendStage::Finalized
+        );
+
+        // No record at all: nothing to guard, nothing written.
+        assert!(!store.save_if(&record("trade-2", "x")).unwrap());
+        assert!(store.load("trade-2").unwrap().is_none());
     }
 
     #[test]

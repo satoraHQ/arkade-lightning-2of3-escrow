@@ -438,21 +438,16 @@ async fn resume_pending_spend_finalizes_a_submitted_record_or_reports_none() {
             .is_none()
     );
 
-    let s = spend(&client);
-    let txid = s.txid();
-    store
-        .save(&PendingSpend {
-            id: "trade".to_string(),
-            ark_txid: txid.to_string(),
-            signed_checkpoints: vec![psbt_to_base64(&psbt(2))],
-            stage: SpendStage::Submitted,
-            token: "t".to_string(),
-            ark_tx: None,
-            unsigned_checkpoints: vec![],
-            party_signed_checkpoints: vec![],
-            server_signed_ark_tx: Some(psbt_to_base64(&s.ark_tx)),
-        })
-        .unwrap();
+    // A `submitted` record as left by a crash after submit, with genuine
+    // evidence from the server.
+    let stalled = RefreshServer::start(Behavior::StallFinalize).await;
+    let stalled_client = connect(&stalled).await;
+    let txid = spend(&stalled_client).txid();
+    let _ = run(&stalled_client, &store, "trade").await.unwrap_err();
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Submitted
+    );
 
     assert_eq!(
         client.resume_pending_spend(&store, "trade").await.unwrap(),
@@ -583,4 +578,114 @@ async fn a_deprecated_server_key_is_accepted_only_for_a_contract_that_names_it()
         .unwrap_err();
     assert!(chain(&error).contains("did not co-sign"), "{error:#}");
     assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_id_is_bound_to_one_transaction() {
+    let server = RefreshServer::start(Behavior::AcceptSpend).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let txid = run(&client, &store, "trade").await.unwrap();
+
+    // A different escrow (other server key, other leaf) under the same id.
+    let other = spend_for_server(&client, DEPRECATED_SIGNER_SEED);
+    assert_ne!(other.txid(), txid);
+    let error = run_spend(&client, &store, "trade", other)
+        .await
+        .unwrap_err();
+    assert!(chain(&error).contains("already bound"), "{error:#}");
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().ark_txid,
+        txid.to_string()
+    );
+}
+
+#[tokio::test]
+async fn tampered_or_unverifiable_stored_evidence_is_not_finalized() {
+    let server = RefreshServer::start(Behavior::AcceptSpend).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+    let s = spend(&client);
+
+    let other = spend_for_server(&client, DEPRECATED_SIGNER_SEED);
+    let record = |evidence: &Psbt| PendingSpend {
+        id: "trade".to_string(),
+        ark_txid: s.txid().to_string(),
+        signed_checkpoints: vec![psbt_to_base64(&psbt(2))],
+        stage: SpendStage::Submitted,
+        token: "t".to_string(),
+        ark_tx: None,
+        unsigned_checkpoints: vec![],
+        party_signed_checkpoints: vec![],
+        server_signed_ark_tx: Some(psbt_to_base64(evidence)),
+    };
+
+    // Evidence for the wrong transaction.
+    store.save(&record(&other.ark_tx)).unwrap();
+    let error = client
+        .resume_pending_spend(&store, "trade")
+        .await
+        .unwrap_err();
+    assert!(
+        chain(&error).contains("does not match recorded ark txid"),
+        "{error:#}"
+    );
+
+    // Right transaction, but no server signature on it.
+    store.save(&record(&s.ark_tx)).unwrap();
+    let error = client
+        .resume_pending_spend(&store, "trade")
+        .await
+        .unwrap_err();
+    assert!(chain(&error).contains("did not co-sign"), "{error:#}");
+
+    assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Submitted
+    );
+}
+
+#[tokio::test]
+async fn finalized_mark_does_not_overwrite_a_record_replaced_after_finalize() {
+    let server = RefreshServer::start(Behavior::AcceptSpend).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    // A store whose `save_if` sees a foreign record at the moment of the
+    // finalized write (as an atomic backend would).
+    struct ReplacedBeforeFinalize<'a>(&'a FileSpendStore);
+    impl SpendStore for ReplacedBeforeFinalize<'_> {
+        fn save(&self, spend: &PendingSpend) -> anyhow::Result<()> {
+            self.0.save(spend)
+        }
+        fn load(&self, id: &str) -> anyhow::Result<Option<PendingSpend>> {
+            self.0.load(id)
+        }
+        fn remove(&self, id: &str) -> anyhow::Result<()> {
+            self.0.remove(id)
+        }
+        fn save_if(&self, spend: &PendingSpend) -> anyhow::Result<bool> {
+            let mut foreign = spend.clone();
+            foreign.token = "foreign".to_string();
+            foreign.stage = SpendStage::Submitting;
+            self.0.save(&foreign)?;
+            self.0.save_if(spend)
+        }
+    }
+
+    let txid = run_spend(
+        &client,
+        &ReplacedBeforeFinalize(&store),
+        "trade",
+        spend(&client),
+    )
+    .await
+    .unwrap();
+    assert_eq!(txid, spend(&client).txid());
+    let remaining = store.load("trade").unwrap().unwrap();
+    assert_eq!(remaining.token, "foreign");
+    assert_eq!(remaining.stage, SpendStage::Submitting);
 }

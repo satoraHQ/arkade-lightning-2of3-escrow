@@ -410,8 +410,9 @@ impl EscrowClient {
     ///   offchain spend" status until Arkade exposes that status explicitly
     ///   for escrow VTXOs.
     /// - `id` — application-level identifier for deduplication (e.g. trade ID).
-    ///   While a record exists for `id`, the persisted transaction is resumed
-    ///   and the other arguments are ignored.
+    ///   An `id` is bound to one ark transaction for good: while a record
+    ///   exists for it, the persisted transaction is resumed, and supplying a
+    ///   different `merged_ark_tx` under the same `id` is an error.
     ///
     /// # Recovery limits
     ///
@@ -452,6 +453,13 @@ impl EscrowClient {
     ) -> Result<Txid> {
         // Resume a previous attempt if one is recorded.
         if let Some(pending) = store.load(id).context("loading pending spend")? {
+            let supplied = merged_ark_tx.unsigned_tx.compute_txid().to_string();
+            anyhow::ensure!(
+                supplied == pending.ark_txid,
+                "spend id {id} is already bound to ark txid {}; refusing a different transaction \
+                 ({supplied}) under the same id",
+                pending.ark_txid
+            );
             return self.resume_recorded(store, pending).await;
         }
 
@@ -514,7 +522,8 @@ impl EscrowClient {
     ///
     /// Returns `Ok(None)` if no record exists. Otherwise behaves exactly like
     /// [`spend_escrow_offchain`] does when it finds a record: re-sends the
-    /// recorded `submit` or `finalize`, clears the record on success.
+    /// recorded `submit` or `finalize`, marks the record finalized on
+    /// success, or returns the txid at once if it already is.
     ///
     /// [`spend_escrow_offchain`]: EscrowClient::spend_escrow_offchain
     pub async fn resume_pending_spend(
@@ -545,16 +554,28 @@ impl EscrowClient {
                 Ok(ark_txid)
             }
             SpendStage::Submitted => {
-                // Fail closed: a record without the verified co-signature
-                // predates the check (or was tampered with), and finalizing
-                // it would release the parties' checkpoint signatures without
-                // evidence that the server committed to the payout.
+                // Fail closed: finalizing releases the parties' checkpoint
+                // signatures, so the stored evidence of the server's
+                // commitment is checked again here. A record without it
+                // predates the check (or was tampered with).
+                let evidence = pending
+                    .server_signed_ark_tx
+                    .as_deref()
+                    .with_context(|| {
+                        format!(
+                            "pending spend {} (ark txid {ark_txid}) at submitted stage has no \
+                             verified server co-signature on record; refusing to finalize",
+                            pending.id
+                        )
+                    })
+                    .and_then(psbt_from_base64)
+                    .context("decoding persisted co-signed ark tx")?;
                 anyhow::ensure!(
-                    pending.server_signed_ark_tx.is_some(),
-                    "pending spend {} (ark txid {ark_txid}) at submitted stage has no verified \
-                     server co-signature on record; refusing to finalize",
-                    pending.id
+                    evidence.unsigned_tx.compute_txid() == ark_txid,
+                    "persisted co-signed ark tx does not match recorded ark txid {ark_txid}"
                 );
+                spend::verify_server_ark_tx_sig(&evidence, &evidence)
+                    .context("re-verifying persisted server co-signature before finalize")?;
                 tracing::info!(%ark_txid, "Resuming finalization of pending spend");
 
                 let final_checkpoints: Vec<Psbt> = pending
@@ -751,18 +772,13 @@ impl EscrowClient {
         self.finalize_internal(ark_txid, final_checkpoints).await?;
 
         // Only this attempt's record is upgraded; a record another attempt
-        // wrote since is left alone (same caveat as `remove_if`: not atomic).
-        let ours = store
-            .load(&pending.id)
-            .context("loading spend record after finalize")?
-            .is_some_and(|current| current.token.is_empty() || current.token == pending.token);
-        if ours {
-            let mut finalized = pending.clone();
-            finalized.stage = SpendStage::Finalized;
-            store
-                .save(&finalized)
-                .context("recording finalized spend")?;
-        } else {
+        // wrote since is left alone.
+        let mut finalized = pending.clone();
+        finalized.stage = SpendStage::Finalized;
+        let written = store
+            .save_if(&finalized)
+            .context("recording finalized spend")?;
+        if !written {
             tracing::warn!(
                 %ark_txid,
                 id = %pending.id,
