@@ -35,7 +35,8 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 - **`plan_release`** — compute effective payout and fee outputs without building PSBTs
 - **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_refresh`** — Schnorr signing helpers
 - **`merge_ark_tx_sigs`** — merge signatures from multiple parties
-- **`SpendStore`** trait — pluggable crash-recovery storage for the two-phase offchain spend protocol
+- **`SpendStore`** trait — pluggable crash-recovery storage for the two-phase offchain spend protocol.
+  A record is written *before* `submit` and removed only after `finalize`, guarded by a per-attempt token
 
 ### Example
 
@@ -198,3 +199,40 @@ RUST_LOG=ark_escrow=debug ruby my_app.rb
 ## Protocol
 
 See [docs/protocol.md](docs/protocol.md) for the full PSBT exchange protocol.
+
+## Spend store contract
+
+`spend_escrow_offchain` writes a `PendingSpend` record **before** the `submit`
+request leaves the process, rewrites it once the server's checkpoint signatures
+are in hand, and deletes it after `finalize` succeeds or after the server
+definitively rejects the submit. Calling it again with the same `id`, or calling
+`resume_pending_spend(id)`, resumes from whatever stage was recorded; the other
+arguments are ignored while a record exists. The record carries a `stage`
+(`submitting` or `submitted`) and a random per-attempt `token`.
+
+What this does and does not recover:
+
+- Crash or failed `finalize` after `submit` returned: fully recoverable, the
+  retry only finalizes.
+- Crash or timeout before the server accepted `submit`: recoverable, the retry
+  re-sends the same submit.
+- Timeout or crash after the server accepted `submit` but before its response
+  was read: **not** recoverable by this gem yet. The retry fails with
+  "inputs already locked" and the record stays at `submitting` with the ark txid
+  for operator follow-up. Recovering the server's checkpoint signatures needs
+  `GetPendingTx` with a proof signed by both escrow parties.
+
+A custom store must:
+
+- Make `save(id, json)` durable before returning. The file store fsyncs.
+- Return the latest JSON from `load(id)`, or `nil`.
+- Optionally implement `remove_if(id, token) -> bool` as a single
+  compare-and-delete (`DELETE ... WHERE id = ? AND (token = ? OR token IS NULL)`).
+  Without it the gem falls back to `load`, compare, `remove`, which is not atomic
+  and only protects against a concurrent attempt if the two calls are otherwise
+  serialised (e.g. by a row lock).
+- Records written by older gem versions have no `stage` or `token`; they load as
+  `submitted` and match any token.
+
+Do not run two spends for the same `id` concurrently. The store is not a lock;
+the token only keeps a finished attempt from deleting another attempt's record.

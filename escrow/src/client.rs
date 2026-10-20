@@ -17,7 +17,7 @@ use crate::contract::{EscrowContract, SignerSet};
 use crate::delegate::DelegateVtxo;
 use crate::refresh::{RefreshInput, RefreshIntent, RefreshVtxo};
 use crate::spend::{self, EscrowVtxo};
-use crate::spend_store::{PendingSpend, SpendStore, psbt_from_base64, psbt_to_base64};
+use crate::spend_store::{PendingSpend, SpendStage, SpendStore, psbt_from_base64, psbt_to_base64};
 
 #[derive(Clone, Debug)]
 pub struct EscrowVtxoStatus {
@@ -399,10 +399,28 @@ impl EscrowClient {
     ///
     /// # Arguments
     ///
-    /// - `store` — persistence backend for crash recovery. For now, callers
-    ///   may also use this as a local proxy for "pending offchain spend"
-    ///   status until Arkade exposes that status explicitly for escrow VTXOs.
+    /// - `store` — persistence backend for crash recovery. A record is written
+    ///   *before* `submit` is sent and removed only after `finalize` succeeds
+    ///   or the server definitively rejects the submit. Calling this method
+    ///   again with the same `id` (or [`resume_pending_spend`]) resumes from
+    ///   the recorded stage. Callers may also use the store as a local proxy
+    ///   for "pending offchain spend" status until Arkade exposes that status
+    ///   explicitly for escrow VTXOs.
     /// - `id` — application-level identifier for deduplication (e.g. trade ID).
+    ///   While a record exists for `id`, the persisted transaction is resumed
+    ///   and the other arguments are ignored.
+    ///
+    /// # Recovery limits
+    ///
+    /// A record at the `submitting` stage is re-submitted as recorded. If the
+    /// server had already accepted the original request (response lost in
+    /// flight), the re-submit fails because the inputs are locked, and the
+    /// record is kept for operator follow-up: the server's checkpoint
+    /// signatures only exist in the lost response. Recovering them needs
+    /// `GetPendingTx` with a proof signed by both escrow parties, which this
+    /// crate does not implement yet.
+    ///
+    /// [`resume_pending_spend`]: EscrowClient::resume_pending_spend
     /// - `merged_ark_tx` — the ark_tx PSBT with all non-server signatures
     ///   already merged (e.g. arbiter + buyer, or arbiter + seller).
     /// - `unsigned_checkpoints` — the raw unsigned checkpoint PSBTs (sent to
@@ -411,6 +429,12 @@ impl EscrowClient {
     /// - `party_signed_checkpoints` — each signing party's independently signed
     ///   checkpoint PSBTs. Outer slice: one entry per party. Inner slice: one
     ///   PSBT per checkpoint, matching `unsigned_checkpoints` in order.
+    ///
+    /// # Concurrency
+    ///
+    /// Callers must not run two calls for the same `id` concurrently; the
+    /// store is not a lock. If they do, the attempt token in the record keeps
+    /// a finished attempt from deleting a record written by the other one.
     ///
     /// # Returns
     ///
@@ -423,64 +447,292 @@ impl EscrowClient {
         unsigned_checkpoints: Vec<Psbt>,
         party_signed_checkpoints: &[&[Psbt]],
     ) -> Result<Txid> {
-        // Step 1: Check for a pending spend from a previous attempt.
+        // Resume a previous attempt if one is recorded.
         if let Some(pending) = store.load(id).context("loading pending spend")? {
-            let ark_txid: Txid = pending
-                .ark_txid
-                .parse()
-                .context("invalid ark_txid in pending spend")?;
-
-            tracing::info!(%ark_txid, "Resuming finalization of pending spend");
-
-            let final_checkpoints: Vec<Psbt> = pending
-                .signed_checkpoints
-                .iter()
-                .map(|b64| psbt_from_base64(b64))
-                .collect::<Result<_>>()
-                .context("decoding persisted checkpoint PSBTs")?;
-
-            self.finalize_internal(ark_txid, final_checkpoints).await?;
-
-            store.remove(id).context("removing finalized spend")?;
-            return Ok(ark_txid);
+            return self.resume_recorded(store, pending).await;
         }
 
-        // Validate checkpoint counts before submitting (can't recover if
-        // submit succeeds but merge fails due to mismatched lengths).
+        // Validate everything that could make the post-submit merge fail
+        // before persisting or sending anything: once the server has
+        // accepted the submit, a merge failure would strand its signatures.
         let expected = unsigned_checkpoints.len();
+        anyhow::ensure!(expected > 0, "no checkpoints to submit");
         for (i, party_cps) in party_signed_checkpoints.iter().enumerate() {
             anyhow::ensure!(
                 party_cps.len() == expected,
                 "party {i} has {} checkpoints, expected {expected}",
                 party_cps.len(),
             );
+            for (j, (party_cp, unsigned_cp)) in
+                party_cps.iter().zip(&unsigned_checkpoints).enumerate()
+            {
+                anyhow::ensure!(
+                    party_cp.unsigned_tx == unsigned_cp.unsigned_tx
+                        && party_cp.inputs.len() == unsigned_cp.inputs.len(),
+                    "party {i} checkpoint {j} does not match unsigned checkpoint {j}",
+                );
+            }
         }
 
-        // Step 2: Fresh submit.
-        let (ark_txid, server_checkpoints) = self
-            .submit_internal(merged_ark_tx, unsigned_checkpoints)
-            .await
-            .context("submitting offchain transaction")?;
-
-        // Step 3: Merge all checkpoint sigs (server + each party).
-        let final_checkpoints =
-            Self::merge_all_checkpoint_sigs(&server_checkpoints, party_signed_checkpoints)?;
-
-        // Persist the fully-signed checkpoints before finalizing so a crash
-        // between submit and finalize is recoverable on the next call.
+        let ark_txid = merged_ark_tx.unsigned_tx.compute_txid();
         let pending = PendingSpend {
             id: id.to_string(),
             ark_txid: ark_txid.to_string(),
-            signed_checkpoints: final_checkpoints.iter().map(psbt_to_base64).collect(),
+            signed_checkpoints: vec![],
+            stage: SpendStage::Submitting,
+            token: PendingSpend::new_token(),
+            ark_tx: Some(psbt_to_base64(&merged_ark_tx)),
+            unsigned_checkpoints: unsigned_checkpoints.iter().map(psbt_to_base64).collect(),
+            party_signed_checkpoints: party_signed_checkpoints
+                .iter()
+                .map(|cps| cps.iter().map(psbt_to_base64).collect())
+                .collect(),
         };
-        store.save(&pending).context("persisting pending spend")?;
+
+        // Persist before the request leaves the process. If this fails,
+        // nothing has been sent and the caller can simply retry.
+        store
+            .save(&pending)
+            .context("persisting pending spend before submit")?;
+
+        self.submit_and_finalize(
+            store,
+            pending,
+            merged_ark_tx,
+            unsigned_checkpoints,
+            party_signed_checkpoints,
+            true,
+        )
+        .await
+    }
+
+    /// Resume the recorded spend for `id` without supplying transaction data.
+    ///
+    /// Returns `Ok(None)` if no record exists. Otherwise behaves exactly like
+    /// [`spend_escrow_offchain`] does when it finds a record: re-sends the
+    /// recorded `submit` or `finalize`, clears the record on success.
+    ///
+    /// [`spend_escrow_offchain`]: EscrowClient::spend_escrow_offchain
+    pub async fn resume_pending_spend(
+        &self,
+        store: &(impl SpendStore + ?Sized),
+        id: &str,
+    ) -> Result<Option<Txid>> {
+        match store.load(id).context("loading pending spend")? {
+            Some(pending) => self.resume_recorded(store, pending).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Drive a recorded spend from its persisted stage to completion.
+    async fn resume_recorded(
+        &self,
+        store: &(impl SpendStore + ?Sized),
+        pending: PendingSpend,
+    ) -> Result<Txid> {
+        let ark_txid: Txid = pending
+            .ark_txid
+            .parse()
+            .context("invalid ark_txid in pending spend")?;
+
+        match pending.stage {
+            SpendStage::Submitted => {
+                tracing::info!(%ark_txid, "Resuming finalization of pending spend");
+
+                let final_checkpoints: Vec<Psbt> = pending
+                    .signed_checkpoints
+                    .iter()
+                    .map(|b64| psbt_from_base64(b64))
+                    .collect::<Result<_>>()
+                    .context("decoding persisted checkpoint PSBTs")?;
+
+                self.finalize_and_clear(store, &pending, ark_txid, final_checkpoints)
+                    .await
+            }
+            SpendStage::Submitting => {
+                tracing::info!(
+                    %ark_txid,
+                    "Resuming pending spend whose submit outcome is unknown; resubmitting"
+                );
+
+                let ark_tx = pending
+                    .ark_tx
+                    .as_deref()
+                    .context("pending spend at submitting stage has no ark tx")
+                    .and_then(psbt_from_base64)
+                    .context("decoding persisted ark tx")?;
+                let unsigned_checkpoints: Vec<Psbt> = pending
+                    .unsigned_checkpoints
+                    .iter()
+                    .map(|b64| psbt_from_base64(b64))
+                    .collect::<Result<_>>()
+                    .context("decoding persisted unsigned checkpoints")?;
+                let party_cps: Vec<Vec<Psbt>> = pending
+                    .party_signed_checkpoints
+                    .iter()
+                    .map(|cps| cps.iter().map(|b64| psbt_from_base64(b64)).collect())
+                    .collect::<Result<_>>()
+                    .context("decoding persisted party checkpoints")?;
+                let party_refs: Vec<&[Psbt]> = party_cps.iter().map(Vec::as_slice).collect();
+
+                self.submit_and_finalize(
+                    store,
+                    pending,
+                    ark_tx,
+                    unsigned_checkpoints,
+                    &party_refs,
+                    false,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Submit, record the server's signatures, finalize, clear the record.
+    /// `pending` must already be persisted at [`SpendStage::Submitting`].
+    ///
+    /// `first_attempt` is true when this process wrote the record just now,
+    /// so a definitive server rejection proves the server never accepted
+    /// the transaction and the record can be cleared. On a resume the same
+    /// rejection ("inputs already locked") may be caused by the original,
+    /// accepted submit, so the record is kept.
+    async fn submit_and_finalize(
+        &self,
+        store: &(impl SpendStore + ?Sized),
+        mut pending: PendingSpend,
+        merged_ark_tx: Psbt,
+        unsigned_checkpoints: Vec<Psbt>,
+        party_signed_checkpoints: &[&[Psbt]],
+        first_attempt: bool,
+    ) -> Result<Txid> {
+        let (ark_txid, server_checkpoints) = match self
+            .submit_internal(merged_ark_tx, unsigned_checkpoints)
+            .await
+        {
+            Ok(res) => res,
+            Err(e) if first_attempt && Self::is_definitive_rejection(&e) => {
+                // The server answered and said no: nothing is locked on its
+                // side, so a retry with corrected data must not replay this.
+                let cleared = store
+                    .remove_if(&pending.id, &pending.token)
+                    .context("clearing rejected spend record")?;
+                return Err(e.context(format!(
+                    "offchain transaction {} rejected by server (pending record {} {})",
+                    pending.ark_txid,
+                    pending.id,
+                    if cleared {
+                        "cleared"
+                    } else {
+                        "not ours; left untouched"
+                    }
+                )));
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "submitting offchain transaction {} (pending record {} retained; \
+                     retry with the same id resubmits it)",
+                    pending.ark_txid, pending.id
+                )));
+            }
+        };
+        anyhow::ensure!(
+            ark_txid.to_string() == pending.ark_txid,
+            "submitted ark txid {ark_txid} differs from recorded {}",
+            pending.ark_txid
+        );
+
+        let final_checkpoints =
+            Self::merge_all_checkpoint_sigs(&server_checkpoints, party_signed_checkpoints)?;
+
+        // Upgrade the record: from here on a retry only needs to finalize.
+        pending.stage = SpendStage::Submitted;
+        pending.signed_checkpoints = final_checkpoints.iter().map(psbt_to_base64).collect();
+        pending.ark_tx = None;
+        pending.unsigned_checkpoints.clear();
+        pending.party_signed_checkpoints.clear();
+        let saved = match store.save(&pending) {
+            Ok(()) => true,
+            Err(e) => {
+                // The server has accepted the spend. The fully-signed
+                // checkpoints are in memory, so finalizing now is still the
+                // best outcome; the stale `Submitting` record only matters if
+                // finalize fails too, and then the save is retried below.
+                tracing::warn!(
+                    %ark_txid,
+                    error = %e,
+                    "Could not persist submitted stage; finalizing from memory"
+                );
+                false
+            }
+        };
 
         tracing::info!(%ark_txid, "Submitted offchain TX, attempting finalization");
 
-        // Step 4: Finalize and clean up.
+        let result = self
+            .finalize_and_clear(store, &pending, ark_txid, final_checkpoints)
+            .await;
+        if result.is_err() && !saved {
+            // Last chance to keep the server's signatures: without this the
+            // record stays at `submitting` and a retry resubmits locked inputs.
+            if let Err(e) = store.save(&pending) {
+                tracing::error!(
+                    %ark_txid,
+                    error = %e,
+                    "Could not persist submitted stage after failed finalize; \
+                     server signatures are lost, record stays at submitting"
+                );
+            }
+        }
+        result
+    }
+
+    /// Whether `err` is a gRPC status that proves the server rejected the
+    /// request without acting on it.
+    ///
+    /// Allowlist, not denylist: tonic also produces statuses on the client
+    /// side after a response was received (e.g. `OutOfRange` for an oversized
+    /// response, `Unimplemented` for unsupported compression), and those must
+    /// stay ambiguous. arkd reports every request rejection as
+    /// `InvalidArgument`; `FailedPrecondition` is its version/digest gate;
+    /// the auth codes are only ever produced before the request is handled.
+    fn is_definitive_rejection(err: &anyhow::Error) -> bool {
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+            .is_some_and(|status| {
+                matches!(
+                    status.code(),
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::PermissionDenied
+                        | tonic::Code::Unauthenticated
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_definitive_rejection_for_test(err: &anyhow::Error) -> bool {
+        Self::is_definitive_rejection(err)
+    }
+
+    async fn finalize_and_clear(
+        &self,
+        store: &(impl SpendStore + ?Sized),
+        pending: &PendingSpend,
+        ark_txid: Txid,
+        final_checkpoints: Vec<Psbt>,
+    ) -> Result<Txid> {
         self.finalize_internal(ark_txid, final_checkpoints).await?;
 
-        store.remove(id).context("removing finalized spend")?;
+        let removed = store
+            .remove_if(&pending.id, &pending.token)
+            .context("removing finalized spend")?;
+        if !removed {
+            tracing::warn!(
+                %ark_txid,
+                id = %pending.id,
+                "Finalized spend record was already replaced or removed; leaving store untouched"
+            );
+        }
         Ok(ark_txid)
     }
 
@@ -747,6 +999,43 @@ mod tests {
 
     fn deprecated_signer(pk: bitcoin::secp256k1::PublicKey) -> server::DeprecatedSigner {
         server::DeprecatedSigner { pk, cutoff_date: 0 }
+    }
+
+    #[test]
+    fn only_server_side_rejection_codes_are_definitive() {
+        let wrapped =
+            |code| anyhow::Error::new(tonic::Status::new(code, "x")).context("submitting");
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+        ] {
+            assert!(
+                EscrowClient::is_definitive_rejection_for_test(&wrapped(code)),
+                "{code:?}"
+            );
+        }
+        for code in [
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+            tonic::Code::Ok,
+        ] {
+            assert!(
+                !EscrowClient::is_definitive_rejection_for_test(&wrapped(code)),
+                "{code:?}"
+            );
+        }
+        // No status at all (our own timeout) is ambiguous.
+        assert!(!EscrowClient::is_definitive_rejection_for_test(
+            &anyhow::anyhow!("submitting offchain transaction timed out after 50ms")
+        ));
     }
 
     #[test]
