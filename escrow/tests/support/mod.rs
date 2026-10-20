@@ -24,6 +24,9 @@ pub struct RefreshServer {
     pub submit_requests: Arc<AtomicUsize>,
     /// Number of `FinalizeTx` requests received.
     pub finalize_requests: Arc<AtomicUsize>,
+    /// Total `tap_script_sigs` seen on checkpoints in `SubmitTx` requests.
+    /// Must stay 0: party checkpoint signatures never travel in submit.
+    pub submitted_checkpoint_sigs: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
@@ -51,28 +54,56 @@ pub enum Behavior {
     RejectSubmit,
     /// `SubmitTx` echoes the PSBTs back without co-signing the ark tx.
     AcceptWithoutCosigning,
+    /// `SubmitTx` co-signs the ark tx with the key derived from this seed
+    /// instead of the active signer key; `FinalizeTx` succeeds.
+    AcceptCosignedBy(u8),
 }
 
-/// The fake server's signing key (its `signer_pubkey` in `GetInfo`).
+/// Seed of the fake server's active signer key (`signer_pubkey` in `GetInfo`).
+pub const ACTIVE_SIGNER_SEED: u8 = 7;
+/// Seed of the one deprecated signer the fake server announces.
+pub const DEPRECATED_SIGNER_SEED: u8 = 8;
+
+/// A keypair from a one-byte seed.
+pub fn keypair(seed: u8) -> Keypair {
+    Keypair::from_seckey_slice(&Secp256k1::new(), &[seed; 32]).unwrap()
+}
+
+/// The fake server's active signing key.
 pub fn server_keypair() -> Keypair {
-    Keypair::from_seckey_slice(&Secp256k1::new(), &[7; 32]).unwrap()
+    keypair(ACTIVE_SIGNER_SEED)
 }
 
-/// Co-sign input 0 of a base64 ark tx PSBT the way arkd does.
-fn cosign_ark_tx(ark_tx_b64: &str) -> String {
+/// Co-sign input 0 of a base64 ark tx PSBT through the same ark-core signing
+/// path a real signer uses, and strip the party data a real server would not
+/// echo back.
+fn cosign_ark_tx(ark_tx_b64: &str, seed: u8) -> String {
     use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
     let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(ark_tx_b64).unwrap()).unwrap();
-    let (msg, leaf_hash) = ark_escrow::spend::ark_tx_sighash(&psbt, 0).unwrap();
-    let keypair = server_keypair();
-    let sig = Secp256k1::new().sign_schnorr_no_aux_rand(&msg, &keypair);
-    psbt.inputs[0].tap_script_sigs.insert(
-        (keypair.x_only_public_key().0, leaf_hash),
-        bitcoin::taproot::Signature {
-            signature: sig,
-            sighash_type: bitcoin::sighash::TapSighashType::Default,
-        },
+    let party_sigs = std::mem::take(&mut psbt.inputs[0].tap_script_sigs);
+    ark_escrow::spend::sign_ark_tx(&mut psbt, &keypair(seed)).unwrap();
+    assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+    assert!(
+        party_sigs
+            .keys()
+            .all(|k| !psbt.inputs[0].tap_script_sigs.contains_key(k))
     );
     STANDARD.encode(psbt.serialize())
+}
+
+/// Number of `tap_script_sigs` across all checkpoints in a `SubmitTx` request.
+fn checkpoint_sig_count(checkpoints: &[String]) -> usize {
+    use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
+    checkpoints
+        .iter()
+        .map(|b64| {
+            let psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(b64).unwrap()).unwrap();
+            psbt.inputs
+                .iter()
+                .map(|i| i.tap_script_sigs.len())
+                .sum::<usize>()
+        })
+        .sum()
 }
 
 #[derive(Message)]
@@ -114,13 +145,15 @@ impl RefreshServer {
     pub async fn start(behavior: Behavior) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let info = server_info().encode_to_vec();
+        let info = server_info_bytes();
         let stream_requested = Arc::new(AtomicBool::new(false));
         let stream_observed = stream_requested.clone();
         let submit_requests = Arc::new(AtomicUsize::new(0));
         let submit_counter = submit_requests.clone();
         let finalize_requests = Arc::new(AtomicUsize::new(0));
         let finalize_counter = finalize_requests.clone();
+        let submitted_checkpoint_sigs = Arc::new(AtomicUsize::new(0));
+        let cp_sig_counter = submitted_checkpoint_sigs.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -129,6 +162,7 @@ impl RefreshServer {
                 let stream_observed = stream_observed.clone();
                 let submit_counter = submit_counter.clone();
                 let finalize_counter = finalize_counter.clone();
+                let cp_sig_counter = cp_sig_counter.clone();
                 connections.spawn(async move {
                     let mut connection = h2::server::handshake(socket).await.unwrap();
                     let mut requests = JoinSet::new();
@@ -138,6 +172,7 @@ impl RefreshServer {
                         let stream_observed = stream_observed.clone();
                         let submit_counter = submit_counter.clone();
                         let finalize_counter = finalize_counter.clone();
+                        let cp_sig_counter = cp_sig_counter.clone();
                         requests.spawn(async move {
                             let (parts, mut body) = request.into_parts();
                             let payload = match parts.uri.path() {
@@ -146,6 +181,10 @@ impl RefreshServer {
                                     let req =
                                         SubmitTxRequest::decode(read_grpc_message(&mut body).await)
                                             .unwrap();
+                                    cp_sig_counter.fetch_add(
+                                        checkpoint_sig_count(&req.checkpoint_txs),
+                                        Ordering::SeqCst,
+                                    );
                                     if matches!(behavior, Behavior::StallSubmit) {
                                         std::future::pending::<()>().await;
                                     }
@@ -159,12 +198,13 @@ impl RefreshServer {
                                         let _ = response.send_response(headers, true);
                                         return;
                                     }
-                                    let final_ark_tx =
-                                        if matches!(behavior, Behavior::AcceptWithoutCosigning) {
-                                            req.signed_ark_tx
-                                        } else {
-                                            cosign_ark_tx(&req.signed_ark_tx)
-                                        };
+                                    let final_ark_tx = match behavior {
+                                        Behavior::AcceptWithoutCosigning => req.signed_ark_tx,
+                                        Behavior::AcceptCosignedBy(seed) => {
+                                            cosign_ark_tx(&req.signed_ark_tx, seed)
+                                        }
+                                        _ => cosign_ark_tx(&req.signed_ark_tx, ACTIVE_SIGNER_SEED),
+                                    };
                                     SubmitTxResponse {
                                         ark_txid: String::new(),
                                         final_ark_tx,
@@ -199,7 +239,8 @@ impl RefreshServer {
                                         | Behavior::StallFinalize
                                         | Behavior::AcceptSpend
                                         | Behavior::RejectSubmit
-                                        | Behavior::AcceptWithoutCosigning => {}
+                                        | Behavior::AcceptWithoutCosigning
+                                        | Behavior::AcceptCosignedBy(_) => {}
                                     }
                                     RegisterIntentResponse {
                                         intent_id: "test-intent".to_owned(),
@@ -256,9 +297,41 @@ impl RefreshServer {
             stream_requested,
             submit_requests,
             finalize_requests,
+            submitted_checkpoint_sigs,
             task,
         }
     }
+}
+
+/// `GetInfoResponse.deprecated_signers` (field 17). The generated proto type
+/// is private to ark-grpc, so the field is encoded separately and appended
+/// to the info bytes; protobuf merges concatenated messages.
+#[derive(Message)]
+struct DeprecatedSigners {
+    #[prost(message, repeated, tag = "17")]
+    deprecated_signers: Vec<DeprecatedSigner>,
+}
+
+#[derive(Message)]
+struct DeprecatedSigner {
+    #[prost(string, tag = "1")]
+    pubkey: String,
+    #[prost(int64, tag = "2")]
+    cutoff_date: i64,
+}
+
+fn server_info_bytes() -> Vec<u8> {
+    let mut bytes = server_info().encode_to_vec();
+    bytes.extend(
+        DeprecatedSigners {
+            deprecated_signers: vec![DeprecatedSigner {
+                pubkey: keypair(DEPRECATED_SIGNER_SEED).public_key().to_string(),
+                cutoff_date: i64::MAX,
+            }],
+        }
+        .encode_to_vec(),
+    );
+    bytes
 }
 
 fn server_info() -> GetInfoResponse {

@@ -223,43 +223,75 @@ pub fn ark_tx_sighash(
     ))
 }
 
-/// Check that `server_signed` is the server's co-signed copy of `local`.
+/// Check that `server_signed` is the server's co-signed copy of `local` and
+/// return the canonical co-signed PSBT: `local` plus the verified server
+/// signature.
 ///
-/// Verifies that both carry the same unsigned transaction and that input 0
-/// carries a valid Schnorr signature from one of `server_keys` over the
-/// escrow leaf recorded in `local`. Returns the key that signed.
+/// The server key is taken from the escrow leaf recorded in `local`'s
+/// `tap_scripts` (the last `CHECKSIG` key of the collaborative 3-of-3
+/// script), not from anything the server announces: only a signature by
+/// that key makes the leaf spendable. The signature must be a `Default`
+/// sighash Schnorr signature over input 0 of the same unsigned transaction.
 ///
 /// This is the client-side half of the protocol invariant: party checkpoint
 /// signatures are only released (via `finalize`) once the server has
-/// committed to the ark transaction that pays the parties out.
-pub fn verify_server_ark_tx_sig(
-    local: &Psbt,
-    server_signed: &Psbt,
-    server_keys: &[XOnlyPublicKey],
-) -> Result<XOnlyPublicKey> {
+/// committed to the ark transaction that pays the parties out. Only the
+/// verified signature is taken from the server's response; everything else
+/// (party signatures, control blocks, witness data) comes from `local`.
+pub fn verify_server_ark_tx_sig(local: &Psbt, server_signed: &Psbt) -> Result<Psbt> {
     anyhow::ensure!(
         server_signed.unsigned_tx == local.unsigned_tx,
         "server returned a different ark transaction (local {}, server {})",
         local.unsigned_tx.compute_txid(),
         server_signed.unsigned_tx.compute_txid(),
     );
+    let server_key = escrow_leaf_server_key(local, 0)?;
     let (msg, leaf_hash) = ark_tx_sighash(local, 0)?;
     let input = server_signed
         .inputs
         .first()
         .context("server ark tx has no inputs")?;
-    let secp = Secp256k1::verification_only();
-    for key in server_keys {
-        if let Some(sig) = input.tap_script_sigs.get(&(*key, leaf_hash)) {
-            secp.verify_schnorr(&sig.signature, &msg, key)
-                .with_context(|| format!("server signature by {key} is invalid"))?;
-            return Ok(*key);
-        }
-    }
-    anyhow::bail!(
-        "server did not co-sign the ark transaction (no signature by any of {} server keys on the escrow leaf)",
-        server_keys.len()
-    )
+    let sig = input
+        .tap_script_sigs
+        .get(&(server_key, leaf_hash))
+        .with_context(|| {
+            format!(
+                "server did not co-sign the ark transaction with the leaf's server key {server_key}"
+            )
+        })?;
+    anyhow::ensure!(
+        sig.sighash_type == TapSighashType::Default,
+        "server signature uses sighash type {:?}, expected Default",
+        sig.sighash_type
+    );
+    Secp256k1::verification_only()
+        .verify_schnorr(&sig.signature, &msg, &server_key)
+        .with_context(|| format!("server signature by {server_key} is invalid"))?;
+
+    let mut canonical = local.clone();
+    canonical.inputs[0]
+        .tap_script_sigs
+        .insert((server_key, leaf_hash), *sig);
+    Ok(canonical)
+}
+
+/// The server key of the collaborative escrow leaf recorded for `input_index`.
+fn escrow_leaf_server_key(psbt: &Psbt, input_index: usize) -> Result<XOnlyPublicKey> {
+    let input = psbt
+        .inputs
+        .get(input_index)
+        .with_context(|| format!("no input at index {input_index}"))?;
+    let (_, (leaf_script, _)) = input
+        .tap_scripts
+        .first_key_value()
+        .context("input has no tap_scripts entry")?;
+    let keys = ark_core::script::extract_checksig_pubkeys(leaf_script);
+    anyhow::ensure!(
+        keys.len() == 3,
+        "escrow leaf has {} CHECKSIG keys, expected 3 (party, party, server)",
+        keys.len()
+    );
+    Ok(keys[2])
 }
 
 // --- Signature merging ---
@@ -289,6 +321,151 @@ pub fn merge_ark_tx_sigs(base: &mut Psbt, other: &Psbt) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::contract::EscrowOptions;
+    use bitcoin::key::Parity;
+    use bitcoin::secp256k1::rand;
+    use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootMerkleBranch};
+    use bitcoin::{ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction};
+
+    struct Fixture {
+        local: Psbt,
+        server: Keypair,
+        other: Keypair,
+    }
+
+    fn fixture() -> Fixture {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let [seller, buyer, arbiter, server, other] =
+            std::array::from_fn(|_| Keypair::new(&secp, &mut rng));
+        let options = EscrowOptions {
+            seller: seller.x_only_public_key().0,
+            buyer: buyer.x_only_public_key().0,
+            arbiter: arbiter.x_only_public_key().0,
+            server: server.x_only_public_key().0,
+            unilateral_exit_delay: Sequence::from_height(10),
+        };
+        let mut local = Psbt::from_unsigned_tx(Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap();
+        local.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        local.inputs[0].tap_scripts.insert(
+            ControlBlock {
+                leaf_version: LeafVersion::TapScript,
+                output_key_parity: Parity::Even,
+                internal_key: server.x_only_public_key().0,
+                merkle_branch: TaprootMerkleBranch::default(),
+            },
+            (options.buyer_arbiter_script(), LeafVersion::TapScript),
+        );
+        sign_ark_tx(&mut local, &buyer).unwrap();
+        sign_ark_tx(&mut local, &arbiter).unwrap();
+        Fixture {
+            local,
+            server,
+            other,
+        }
+    }
+
+    #[test]
+    fn accepts_a_valid_server_signature_and_returns_the_canonical_psbt() {
+        let f = fixture();
+        let mut response = f.local.clone();
+        // The server strips party data and adds its own signature.
+        response.inputs[0].tap_script_sigs.clear();
+        response.inputs[0].tap_scripts.clear();
+        response.inputs[0].witness_utxo = None;
+        let mut signed = f.local.clone();
+        sign_ark_tx(&mut signed, &f.server).unwrap();
+        let (_, leaf_hash) = ark_tx_sighash(&f.local, 0).unwrap();
+        let server_key = f.server.x_only_public_key().0;
+        let sig = signed.inputs[0].tap_script_sigs[&(server_key, leaf_hash)];
+        response.inputs[0]
+            .tap_script_sigs
+            .insert((server_key, leaf_hash), sig);
+
+        let canonical = verify_server_ark_tx_sig(&f.local, &response).unwrap();
+        assert_eq!(canonical.inputs[0].tap_script_sigs.len(), 3);
+        assert!(canonical.inputs[0].witness_utxo.is_some());
+        assert_eq!(canonical.inputs[0].tap_scripts.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_signature_by_a_key_that_is_not_the_leaf_server_key() {
+        let f = fixture();
+        let mut response = f.local.clone();
+        sign_ark_tx(&mut response, &f.other).unwrap();
+        let err = verify_server_ark_tx_sig(&f.local, &response).unwrap_err();
+        assert!(format!("{err:#}").contains("did not co-sign"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_a_missing_signature_even_with_party_signatures_present() {
+        let f = fixture();
+        let err = verify_server_ark_tx_sig(&f.local, &f.local).unwrap_err();
+        assert!(format!("{err:#}").contains("did not co-sign"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_a_server_signature_over_a_different_transaction() {
+        let f = fixture();
+        let mut other_tx = f.local.clone();
+        other_tx.unsigned_tx.output[0].value = Amount::from_sat(999);
+        sign_ark_tx(&mut other_tx, &f.server).unwrap();
+        let (_, leaf_hash) = ark_tx_sighash(&f.local, 0).unwrap();
+        let server_key = f.server.x_only_public_key().0;
+        let sig = other_tx.inputs[0].tap_script_sigs[&(server_key, leaf_hash)];
+        // Transplant the signature onto a response for the right tx.
+        let mut response = f.local.clone();
+        response.inputs[0]
+            .tap_script_sigs
+            .insert((server_key, leaf_hash), sig);
+        let err = verify_server_ark_tx_sig(&f.local, &response).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid"), "{err:#}");
+
+        // And a response whose unsigned tx differs is rejected before any check.
+        let err = verify_server_ark_tx_sig(&f.local, &other_tx).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("different ark transaction"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_default_sighash_type() {
+        let f = fixture();
+        let mut response = f.local.clone();
+        sign_ark_tx(&mut response, &f.server).unwrap();
+        let (_, leaf_hash) = ark_tx_sighash(&f.local, 0).unwrap();
+        let server_key = f.server.x_only_public_key().0;
+        let sig = response.inputs[0]
+            .tap_script_sigs
+            .get_mut(&(server_key, leaf_hash))
+            .unwrap();
+        sig.sighash_type = TapSighashType::All;
+        let err = verify_server_ark_tx_sig(&f.local, &response).unwrap_err();
+        assert!(format!("{err:#}").contains("sighash type"), "{err:#}");
+    }
 }
 
 #[cfg(test)]

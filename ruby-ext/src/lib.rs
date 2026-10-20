@@ -4,7 +4,7 @@ use std::time::Duration;
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
 use ark_escrow::refresh::{RefreshIntent, RefreshVtxo};
-use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
+use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStage, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
@@ -515,7 +515,11 @@ impl RbClient {
         id: String,
         contract: &RbContract,
     ) -> Result<(bool, Vec<(String, u64, bool)>, bool), Error> {
-        let pending_offchain = self.store.load(&id).map_err(to_magnus_err)?.is_some();
+        let pending_offchain = self
+            .store
+            .load(&id)
+            .map_err(to_magnus_err)?
+            .is_some_and(|p| p.stage != SpendStage::Finalized);
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let (vtxos, any_recoverable) = self
             .rt

@@ -8,9 +8,10 @@
 //!
 //! [`EscrowClient::spend_escrow_offchain`](crate::client::EscrowClient::spend_escrow_offchain)
 //! therefore records a [`PendingSpend`] *before* the first request leaves the
-//! process, upgrades it once the server's checkpoint signatures are in hand,
-//! and removes it only after `finalize` succeeds, and only if the record still
-//! belongs to the attempt that finalized ([`SpendStore::remove_if`]).
+//! process, upgrades it once the server's verified ark tx co-signature and
+//! checkpoint signatures are in hand, and marks it [`SpendStage::Finalized`]
+//! after `finalize` succeeds. Finalized records are kept, not removed: they
+//! are the parties' evidence of the server's commitment.
 //!
 //! [`SpendStore`] is the trait that backends implement. A file-based default
 //! ([`FileSpendStore`]) is provided.
@@ -34,6 +35,12 @@ pub enum SpendStage {
     /// `submit` succeeded and the fully-signed checkpoints are stored.
     /// Resuming re-sends `finalize`.
     Submitted,
+    /// `finalize` succeeded. The record is kept: it holds the server's
+    /// verified co-signature on the ark tx and the fully-signed checkpoints,
+    /// the parties' only evidence of the server's commitment. Resuming
+    /// returns the ark txid without contacting the server. Removal is up to
+    /// the application's retention policy ([`SpendStore::remove`]).
+    Finalized,
 }
 
 impl Default for SpendStage {
@@ -117,10 +124,11 @@ pub trait SpendStore {
     /// Load a pending spend by its application-level ID.
     fn load(&self, id: &str) -> Result<Option<PendingSpend>>;
 
-    /// Remove a pending spend unconditionally.
+    /// Remove a spend record unconditionally.
     ///
-    /// The spend protocol does not call this; it uses [`remove_if`].
-    /// Operators may use it to clear a record by hand.
+    /// The spend protocol calls this only to clear a record the server
+    /// definitively rejected (via [`remove_if`]). Finalized records are left
+    /// for the application to prune under its own retention policy.
     ///
     /// [`remove_if`]: SpendStore::remove_if
     fn remove(&self, id: &str) -> Result<()>;

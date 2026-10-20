@@ -203,12 +203,25 @@ See [docs/protocol.md](docs/protocol.md) for the full PSBT exchange protocol.
 ## Spend store contract
 
 `spend_escrow_offchain` writes a `PendingSpend` record **before** the `submit`
-request leaves the process, rewrites it once the server's checkpoint signatures
-are in hand, and deletes it after `finalize` succeeds or after the server
-definitively rejects the submit. Calling it again with the same `id`, or calling
-`resume_pending_spend(id)`, resumes from whatever stage was recorded; the other
-arguments are ignored while a record exists. The record carries a `stage`
-(`submitting` or `submitted`) and a random per-attempt `token`.
+request leaves the process, rewrites it once the server's verified ark tx
+co-signature and checkpoint signatures are in hand, marks it `finalized` after
+`finalize` succeeds, and deletes it only if the server definitively rejects the
+submit. Calling it again with the same `id`, or calling
+`resume_pending_spend(id)`, resumes from whatever stage was recorded; a
+finalized record returns its txid without a server call. The other arguments
+are ignored while a record exists. The record carries a `stage` (`submitting`,
+`submitted`, `finalized`), a random per-attempt `token`, and from `submitted` on
+the canonical co-signed ark tx (`server_signed_ark_tx`) and the fully-signed
+checkpoints.
+
+Finalized records are **kept**: they are the parties' only evidence that the
+server committed to the payout. Prune them under your own retention policy with
+`remove(id)`. `get_escrow_vtxo_status` reports `pending_offchain` only for
+records that are not finalized.
+
+Records written by gem versions before the co-signature check have no
+`server_signed_ark_tx`. If such a record is at `submitted` stage, resuming it
+fails closed rather than releasing checkpoint signatures without evidence.
 
 What this does and does not recover:
 
@@ -232,7 +245,8 @@ A custom store must:
   and only protects against a concurrent attempt if the two calls are otherwise
   serialised (e.g. by a row lock).
 - Records written by older gem versions have no `stage` or `token`; they load as
-  `submitted` and match any token.
+  `submitted` and match any token, but see above: without `server_signed_ark_tx`
+  they are not finalized automatically.
 
 Do not run two spends for the same `id` concurrently. The store is not a lock;
 the token only keeps a finished attempt from deleting another attempt's record.

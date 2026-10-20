@@ -51,9 +51,11 @@ signatures can be collected before the Arkade server sees the checkpoints.
      │               │ 10. submit(merged_ark_tx, UNSIGNED checkpoints)
      │               │──────────────────────────────>│
      │               │               │               │
-     │               │ 11. Server-signed checkpoints │
+     │               │ 11. co-signed ark_tx + server-signed checkpoints
      │               │<─────────────────────────────│
      │               │               │
+     │               │ 11a. verify server sig on ark_tx (leaf's server key)
+     │               │      → abort here if missing/invalid
      │               │ 12. merge arbiter cp sigs into server cps
      │               │ 13. merge buyer cp sigs into server cps
      │               │ 14. finalize(txid, fully-signed cps)
@@ -76,7 +78,7 @@ signatures can be collected before the Arkade server sees the checkpoints.
 9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, buyer_signed)`
 10. **Arbiter submits to Arkade** — `submit(merged_ark_tx, UNSIGNED_checkpoints)` via gRPC. **Only unsigned checkpoints are sent** — checkpoint signatures must not be revealed to the server before it co-signs the ark_tx.
 11. **Arkade returns the co-signed ark_tx and server-signed checkpoints** — server adds its signatures to both
-11a. **Arbiter verifies the server's co-signature** on the ark_tx against the submitted transaction and the server's announced keys (`verify_server_ark_tx_sig`). If it is missing or invalid, the flow stops here: no checkpoint signature is ever sent. The verified co-signed ark_tx is kept in the spend record.
+11a. **Arbiter verifies the server's co-signature** on the ark_tx (`verify_server_ark_tx_sig`): same unsigned transaction, and a valid `Default`-sighash Schnorr signature by the server key named in the escrow leaf being spent. Keys the server merely announces do not count. If the check fails, the flow stops here: no checkpoint signature is ever sent. The canonical co-signed ark_tx (local PSBT plus the verified server signature) is kept in the spend record, through finalization, as the parties' evidence of the server's commitment.
 12. **Arbiter merges its checkpoint sigs** into the server-signed copies
 13. **Arbiter merges Buyer's checkpoint sigs** into the result
 14. **Arbiter finalizes** — `finalize(ark_txid, fully_signed_checkpoints)` via gRPC
