@@ -127,8 +127,11 @@ pub trait SpendStore {
     /// `token`.
     ///
     /// The default implementation is load → compare → [`remove`], which is
-    /// not atomic. Backends that can compare-and-delete in one step (e.g.
-    /// `DELETE ... WHERE id = ? AND token = ?`) should override it.
+    /// not atomic: a record replaced between the load and the remove is
+    /// still deleted. It is only safe under the documented rule that spends
+    /// for one `id` never run concurrently. Backends that can
+    /// compare-and-delete in one step (e.g. `DELETE ... WHERE id = ? AND
+    /// token = ?`) should override it to get a real guarantee.
     ///
     /// [`remove`]: SpendStore::remove
     fn remove_if(&self, id: &str, token: &str) -> Result<bool> {
@@ -170,16 +173,14 @@ impl FileSpendStore {
     }
 
     fn sync_dir(&self) -> Result<()> {
-        // Directory fsync makes the rename durable. Not supported on every
-        // platform/filesystem; failure to open or sync is not fatal there.
+        // Directory fsync makes the rename durable. `save` must not report
+        // success unless this succeeded.
         #[cfg(unix)]
         {
-            use std::io::Write as _;
-            if let Ok(mut dir) = std::fs::File::open(&self.dir) {
-                let _ = dir.flush();
-                dir.sync_all()
-                    .with_context(|| format!("syncing {}", self.dir.display()))?;
-            }
+            std::fs::File::open(&self.dir)
+                .with_context(|| format!("opening {} for sync", self.dir.display()))?
+                .sync_all()
+                .with_context(|| format!("syncing {}", self.dir.display()))?;
         }
         Ok(())
     }

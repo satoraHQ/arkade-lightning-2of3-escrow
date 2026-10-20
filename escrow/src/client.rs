@@ -400,14 +400,27 @@ impl EscrowClient {
     /// # Arguments
     ///
     /// - `store` — persistence backend for crash recovery. A record is written
-    ///   *before* `submit` is sent and removed only after `finalize` succeeds,
-    ///   so a crash or lost response at any point is resumable by calling this
-    ///   method again with the same `id`. Callers may also use the store as a
-    ///   local proxy for "pending offchain spend" status until Arkade exposes
-    ///   that status explicitly for escrow VTXOs.
+    ///   *before* `submit` is sent and removed only after `finalize` succeeds
+    ///   or the server definitively rejects the submit. Calling this method
+    ///   again with the same `id` (or [`resume_pending_spend`]) resumes from
+    ///   the recorded stage. Callers may also use the store as a local proxy
+    ///   for "pending offchain spend" status until Arkade exposes that status
+    ///   explicitly for escrow VTXOs.
     /// - `id` — application-level identifier for deduplication (e.g. trade ID).
     ///   While a record exists for `id`, the persisted transaction is resumed
     ///   and the other arguments are ignored.
+    ///
+    /// # Recovery limits
+    ///
+    /// A record at the `submitting` stage is re-submitted as recorded. If the
+    /// server had already accepted the original request (response lost in
+    /// flight), the re-submit fails because the inputs are locked, and the
+    /// record is kept for operator follow-up: the server's checkpoint
+    /// signatures only exist in the lost response. Recovering them needs
+    /// `GetPendingTx` with a proof signed by both escrow parties, which this
+    /// crate does not implement yet.
+    ///
+    /// [`resume_pending_spend`]: EscrowClient::resume_pending_spend
     /// - `merged_ark_tx` — the ark_tx PSBT with all non-server signatures
     ///   already merged (e.g. arbiter + buyer, or arbiter + seller).
     /// - `unsigned_checkpoints` — the raw unsigned checkpoint PSBTs (sent to
@@ -436,10 +449,12 @@ impl EscrowClient {
     ) -> Result<Txid> {
         // Resume a previous attempt if one is recorded.
         if let Some(pending) = store.load(id).context("loading pending spend")? {
-            return self.resume_pending_spend(store, pending).await;
+            return self.resume_recorded(store, pending).await;
         }
 
-        // Validate checkpoint counts before persisting anything.
+        // Validate everything that could make the post-submit merge fail
+        // before persisting or sending anything: once the server has
+        // accepted the submit, a merge failure would strand its signatures.
         let expected = unsigned_checkpoints.len();
         anyhow::ensure!(expected > 0, "no checkpoints to submit");
         for (i, party_cps) in party_signed_checkpoints.iter().enumerate() {
@@ -448,6 +463,15 @@ impl EscrowClient {
                 "party {i} has {} checkpoints, expected {expected}",
                 party_cps.len(),
             );
+            for (j, (party_cp, unsigned_cp)) in
+                party_cps.iter().zip(&unsigned_checkpoints).enumerate()
+            {
+                anyhow::ensure!(
+                    party_cp.unsigned_tx == unsigned_cp.unsigned_tx
+                        && party_cp.inputs.len() == unsigned_cp.inputs.len(),
+                    "party {i} checkpoint {j} does not match unsigned checkpoint {j}",
+                );
+            }
         }
 
         let ark_txid = merged_ark_tx.unsigned_tx.compute_txid();
@@ -477,12 +501,31 @@ impl EscrowClient {
             merged_ark_tx,
             unsigned_checkpoints,
             party_signed_checkpoints,
+            true,
         )
         .await
     }
 
+    /// Resume the recorded spend for `id` without supplying transaction data.
+    ///
+    /// Returns `Ok(None)` if no record exists. Otherwise behaves exactly like
+    /// [`spend_escrow_offchain`] does when it finds a record: re-sends the
+    /// recorded `submit` or `finalize`, clears the record on success.
+    ///
+    /// [`spend_escrow_offchain`]: EscrowClient::spend_escrow_offchain
+    pub async fn resume_pending_spend(
+        &self,
+        store: &(impl SpendStore + ?Sized),
+        id: &str,
+    ) -> Result<Option<Txid>> {
+        match store.load(id).context("loading pending spend")? {
+            Some(pending) => self.resume_recorded(store, pending).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Drive a recorded spend from its persisted stage to completion.
-    async fn resume_pending_spend(
+    async fn resume_recorded(
         &self,
         store: &(impl SpendStore + ?Sized),
         pending: PendingSpend,
@@ -532,14 +575,27 @@ impl EscrowClient {
                     .context("decoding persisted party checkpoints")?;
                 let party_refs: Vec<&[Psbt]> = party_cps.iter().map(Vec::as_slice).collect();
 
-                self.submit_and_finalize(store, pending, ark_tx, unsigned_checkpoints, &party_refs)
-                    .await
+                self.submit_and_finalize(
+                    store,
+                    pending,
+                    ark_tx,
+                    unsigned_checkpoints,
+                    &party_refs,
+                    false,
+                )
+                .await
             }
         }
     }
 
     /// Submit, record the server's signatures, finalize, clear the record.
     /// `pending` must already be persisted at [`SpendStage::Submitting`].
+    ///
+    /// `first_attempt` is true when this process wrote the record just now,
+    /// so a definitive server rejection proves the server never accepted
+    /// the transaction and the record can be cleared. On a resume the same
+    /// rejection ("inputs already locked") may be caused by the original,
+    /// accepted submit, so the record is kept.
     async fn submit_and_finalize(
         &self,
         store: &(impl SpendStore + ?Sized),
@@ -547,17 +603,38 @@ impl EscrowClient {
         merged_ark_tx: Psbt,
         unsigned_checkpoints: Vec<Psbt>,
         party_signed_checkpoints: &[&[Psbt]],
+        first_attempt: bool,
     ) -> Result<Txid> {
-        let (ark_txid, server_checkpoints) = self
+        let (ark_txid, server_checkpoints) = match self
             .submit_internal(merged_ark_tx, unsigned_checkpoints)
             .await
-            .with_context(|| {
-                format!(
+        {
+            Ok(res) => res,
+            Err(e) if first_attempt && Self::is_definitive_rejection(&e) => {
+                // The server answered and said no: nothing is locked on its
+                // side, so a retry with corrected data must not replay this.
+                let cleared = store
+                    .remove_if(&pending.id, &pending.token)
+                    .context("clearing rejected spend record")?;
+                return Err(e.context(format!(
+                    "offchain transaction {} rejected by server (pending record {} {})",
+                    pending.ark_txid,
+                    pending.id,
+                    if cleared {
+                        "cleared"
+                    } else {
+                        "not ours; left untouched"
+                    }
+                )));
+            }
+            Err(e) => {
+                return Err(e.context(format!(
                     "submitting offchain transaction {} (pending record {} retained; \
                      retry with the same id resubmits it)",
                     pending.ark_txid, pending.id
-                )
-            })?;
+                )));
+            }
+        };
         anyhow::ensure!(
             ark_txid.to_string() == pending.ark_txid,
             "submitted ark txid {ark_txid} differs from recorded {}",
@@ -573,21 +650,61 @@ impl EscrowClient {
         pending.ark_tx = None;
         pending.unsigned_checkpoints.clear();
         pending.party_signed_checkpoints.clear();
-        if let Err(e) = store.save(&pending) {
-            // The server has accepted the spend. The fully-signed checkpoints
-            // are in memory, so finalizing now is still the best outcome; the
-            // stale `Submitting` record only matters if finalize fails too.
-            tracing::warn!(
-                %ark_txid,
-                error = %e,
-                "Could not persist submitted stage; finalizing from memory"
-            );
-        }
+        let saved = match store.save(&pending) {
+            Ok(()) => true,
+            Err(e) => {
+                // The server has accepted the spend. The fully-signed
+                // checkpoints are in memory, so finalizing now is still the
+                // best outcome; the stale `Submitting` record only matters if
+                // finalize fails too, and then the save is retried below.
+                tracing::warn!(
+                    %ark_txid,
+                    error = %e,
+                    "Could not persist submitted stage; finalizing from memory"
+                );
+                false
+            }
+        };
 
         tracing::info!(%ark_txid, "Submitted offchain TX, attempting finalization");
 
-        self.finalize_and_clear(store, &pending, ark_txid, final_checkpoints)
-            .await
+        let result = self
+            .finalize_and_clear(store, &pending, ark_txid, final_checkpoints)
+            .await;
+        if result.is_err() && !saved {
+            // Last chance to keep the server's signatures: without this the
+            // record stays at `submitting` and a retry resubmits locked inputs.
+            if let Err(e) = store.save(&pending) {
+                tracing::error!(
+                    %ark_txid,
+                    error = %e,
+                    "Could not persist submitted stage after failed finalize; \
+                     server signatures are lost, record stays at submitting"
+                );
+            }
+        }
+        result
+    }
+
+    /// Whether `err` is a gRPC status from the server that rejects the
+    /// request outright, as opposed to a timeout, transport or server-side
+    /// failure where the request may still have been accepted.
+    fn is_definitive_rejection(err: &anyhow::Error) -> bool {
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+            .is_some_and(|status| {
+                !matches!(
+                    status.code(),
+                    tonic::Code::Unknown
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::ResourceExhausted
+                        | tonic::Code::Aborted
+                        | tonic::Code::Internal
+                        | tonic::Code::Unavailable
+                        | tonic::Code::DataLoss
+                        | tonic::Code::Cancelled
+                )
+            })
     }
 
     async fn finalize_and_clear(

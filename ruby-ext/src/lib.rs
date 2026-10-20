@@ -897,6 +897,20 @@ impl RbClient {
 
         Ok(txid.to_string())
     }
+
+    /// Resume a recorded offchain spend by `id` without re-supplying the
+    /// transaction data.
+    ///
+    /// Returns the Arkade transaction ID (hex string) once finalized, or
+    /// `nil` if the store holds no record for `id`.
+    fn resume_pending_spend(&self, id: String) -> Result<Option<String>, Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+        let txid = self
+            .rt
+            .block_on(client.resume_pending_spend(&*self.store, &id))
+            .map_err(to_magnus_err)?;
+        Ok(txid.map(|t| t.to_string()))
+    }
 }
 
 // --- Signing helpers (stateless, exposed as module functions) ---
@@ -1060,6 +1074,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     client_class.define_method(
         "spend_escrow_offchain",
         method!(RbClient::spend_escrow_offchain, 4),
+    )?;
+    client_class.define_method(
+        "resume_pending_spend",
+        method!(RbClient::resume_pending_spend, 1),
     )?;
     client_class.define_method("prepare_refresh", method!(RbClient::prepare_refresh, 4))?;
     client_class.define_method("refresh_escrow", method!(RbClient::refresh_escrow, 4))?;

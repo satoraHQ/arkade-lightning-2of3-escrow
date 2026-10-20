@@ -45,6 +45,8 @@ pub enum Behavior {
     StallFinalize,
     /// `SubmitTx` echoes the submitted PSBTs back; `FinalizeTx` succeeds.
     AcceptSpend,
+    /// `SubmitTx` answers with gRPC `InvalidArgument`.
+    RejectSubmit,
 }
 
 #[derive(Message)]
@@ -121,6 +123,16 @@ impl RefreshServer {
                                     if matches!(behavior, Behavior::StallSubmit) {
                                         std::future::pending::<()>().await;
                                     }
+                                    if matches!(behavior, Behavior::RejectSubmit) {
+                                        let headers = http::Response::builder()
+                                            .header("content-type", "application/grpc")
+                                            .header("grpc-status", "3")
+                                            .header("grpc-message", "invalid ark psbt")
+                                            .body(())
+                                            .unwrap();
+                                        let _ = response.send_response(headers, true);
+                                        return;
+                                    }
                                     SubmitTxResponse {
                                         ark_txid: String::new(),
                                         final_ark_tx: req.signed_ark_tx,
@@ -153,7 +165,8 @@ impl RefreshServer {
                                         | Behavior::StallInfo
                                         | Behavior::StallSubmit
                                         | Behavior::StallFinalize
-                                        | Behavior::AcceptSpend => {}
+                                        | Behavior::AcceptSpend
+                                        | Behavior::RejectSubmit => {}
                                     }
                                     RegisterIntentResponse {
                                         intent_id: "test-intent".to_owned(),

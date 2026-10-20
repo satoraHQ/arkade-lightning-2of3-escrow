@@ -236,3 +236,179 @@ async fn finished_attempt_does_not_delete_a_record_it_did_not_write() {
         .expect("foreign record survives");
     assert_eq!(remaining.token, "foreign");
 }
+
+#[tokio::test]
+async fn definitive_rejection_on_first_attempt_clears_the_record() {
+    let server = RefreshServer::start(Behavior::RejectSubmit).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let error = run(&client, &store, "trade").await.unwrap_err();
+    assert!(
+        error.to_string().contains("rejected by server"),
+        "{error:#}"
+    );
+    assert!(
+        store.load("trade").unwrap().is_none(),
+        "a rejected first attempt must not poison the id"
+    );
+
+    // A corrected retry is a fresh submit, not a replay.
+    let _ = run(&client, &store, "trade").await.unwrap_err();
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn definitive_rejection_on_resume_keeps_the_record() {
+    let server = RefreshServer::start(Behavior::RejectSubmit).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    // A record left by a lost first attempt (as if the process died).
+    let s = spend();
+    store
+        .save(&PendingSpend {
+            id: "trade".to_string(),
+            ark_txid: s.ark_tx.unsigned_tx.compute_txid().to_string(),
+            signed_checkpoints: vec![],
+            stage: SpendStage::Submitting,
+            token: "orig".to_string(),
+            ark_tx: Some(ark_escrow::spend_store::psbt_to_base64(&s.ark_tx)),
+            unsigned_checkpoints: s
+                .checkpoints
+                .iter()
+                .map(ark_escrow::spend_store::psbt_to_base64)
+                .collect(),
+            party_signed_checkpoints: vec![],
+        })
+        .unwrap();
+
+    // The rejection may be "inputs already locked" by our own earlier submit.
+    let error = client
+        .resume_pending_spend(&store, "trade")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("retained"), "{error:#}");
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 1);
+    let kept = store
+        .load("trade")
+        .unwrap()
+        .expect("record kept for operator");
+    assert_eq!(kept.stage, SpendStage::Submitting);
+    assert_eq!(kept.token, "orig");
+}
+
+#[tokio::test]
+async fn resume_pending_spend_finalizes_a_submitted_record_or_reports_none() {
+    let server = RefreshServer::start(Behavior::AcceptSpend).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    assert!(
+        client
+            .resume_pending_spend(&store, "trade")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let txid = spend().ark_tx.unsigned_tx.compute_txid();
+    store
+        .save(&PendingSpend {
+            id: "trade".to_string(),
+            ark_txid: txid.to_string(),
+            signed_checkpoints: vec![ark_escrow::spend_store::psbt_to_base64(&psbt(2))],
+            stage: SpendStage::Submitted,
+            token: "t".to_string(),
+            ark_tx: None,
+            unsigned_checkpoints: vec![],
+            party_signed_checkpoints: vec![],
+        })
+        .unwrap();
+
+    assert_eq!(
+        client.resume_pending_spend(&store, "trade").await.unwrap(),
+        Some(txid)
+    );
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 1);
+    assert!(store.load("trade").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mismatched_party_checkpoints_are_rejected_before_anything_is_sent_or_written() {
+    let server = RefreshServer::start(Behavior::AcceptSpend).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let s = spend();
+    // Same length, but the second party signed a different transaction.
+    let wrong = vec![psbt(2), psbt(9)];
+    let error = client
+        .spend_escrow_offchain(
+            &store,
+            "trade",
+            s.ark_tx,
+            s.checkpoints,
+            &[&s.party_a, &wrong],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not match"), "{error:#}");
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 0);
+    assert!(store.load("trade").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn submitted_stage_is_persisted_after_a_failed_finalize_even_if_the_first_save_failed() {
+    let server = RefreshServer::start(Behavior::StallFinalize).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    // Fails the `Submitted` save exactly once.
+    struct FlakySubmittedSave<'a> {
+        inner: &'a FileSpendStore,
+        failed_once: std::sync::atomic::AtomicBool,
+    }
+    impl SpendStore for FlakySubmittedSave<'_> {
+        fn save(&self, spend: &PendingSpend) -> anyhow::Result<()> {
+            if spend.stage == SpendStage::Submitted
+                && !self.failed_once.swap(true, Ordering::SeqCst)
+            {
+                anyhow::bail!("disk full");
+            }
+            self.inner.save(spend)
+        }
+        fn load(&self, id: &str) -> anyhow::Result<Option<PendingSpend>> {
+            self.inner.load(id)
+        }
+        fn remove(&self, id: &str) -> anyhow::Result<()> {
+            self.inner.remove(id)
+        }
+    }
+    let flaky = FlakySubmittedSave {
+        inner: &store,
+        failed_once: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    let s = spend();
+    let error = client
+        .spend_escrow_offchain(
+            &flaky,
+            "trade",
+            s.ark_tx,
+            s.checkpoints,
+            &[&s.party_a, &s.party_b],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("finalizing"), "{error:#}");
+
+    let pending = store.load("trade").unwrap().unwrap();
+    assert_eq!(
+        pending.stage,
+        SpendStage::Submitted,
+        "retried save kept the server sigs"
+    );
+    assert_eq!(pending.signed_checkpoints.len(), 2);
+}

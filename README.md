@@ -204,10 +204,23 @@ See [docs/protocol.md](docs/protocol.md) for the full PSBT exchange protocol.
 
 `spend_escrow_offchain` writes a `PendingSpend` record **before** the `submit`
 request leaves the process, rewrites it once the server's checkpoint signatures
-are in hand, and deletes it only after `finalize` succeeds. Calling it again
-with the same `id` resumes from whatever stage was recorded; the other
+are in hand, and deletes it after `finalize` succeeds or after the server
+definitively rejects the submit. Calling it again with the same `id`, or calling
+`resume_pending_spend(id)`, resumes from whatever stage was recorded; the other
 arguments are ignored while a record exists. The record carries a `stage`
 (`submitting` or `submitted`) and a random per-attempt `token`.
+
+What this does and does not recover:
+
+- Crash or failed `finalize` after `submit` returned: fully recoverable, the
+  retry only finalizes.
+- Crash or timeout before the server accepted `submit`: recoverable, the retry
+  re-sends the same submit.
+- Timeout or crash after the server accepted `submit` but before its response
+  was read: **not** recoverable by this gem yet. The retry fails with
+  "inputs already locked" and the record stays at `submitting` with the ark txid
+  for operator follow-up. Recovering the server's checkpoint signatures needs
+  `GetPendingTx` with a proof signed by both escrow parties.
 
 A custom store must:
 
@@ -215,7 +228,9 @@ A custom store must:
 - Return the latest JSON from `load(id)`, or `nil`.
 - Optionally implement `remove_if(id, token) -> bool` as a single
   compare-and-delete (`DELETE ... WHERE id = ? AND (token = ? OR token IS NULL)`).
-  Without it the gem falls back to `load`, compare, `remove`, which is not atomic.
+  Without it the gem falls back to `load`, compare, `remove`, which is not atomic
+  and only protects against a concurrent attempt if the two calls are otherwise
+  serialised (e.g. by a row lock).
 - Records written by older gem versions have no `stage` or `token`; they load as
   `submitted` and match any token.
 
