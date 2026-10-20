@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use ark_core::send::{self, OffchainTransactions, SendReceiver, VtxoInput};
 use ark_core::server;
+use bitcoin::hashes::Hash;
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
+use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::taproot::TapLeafHash;
 use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 
 use crate::contract::{EscrowContract, SignerSet};
@@ -174,6 +177,89 @@ pub fn sign_checkpoint(psbt: &mut Psbt, keypair: &Keypair) -> Result<()> {
     .context("signing checkpoint transaction")?;
 
     Ok(())
+}
+
+// --- Server co-signature verification ---
+
+/// Compute the taproot script-spend sighash for `input_index` of `psbt`,
+/// using the leaf recorded in the input's `tap_scripts`.
+///
+/// Mirrors what [`ark_core::send::sign_ark_transaction`] signs.
+pub fn ark_tx_sighash(
+    psbt: &Psbt,
+    input_index: usize,
+) -> Result<(secp256k1::Message, TapLeafHash)> {
+    let witness_utxos = psbt
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input
+                .witness_utxo
+                .clone()
+                .with_context(|| format!("input {i} has no witness_utxo"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let input = psbt
+        .inputs
+        .get(input_index)
+        .with_context(|| format!("no input at index {input_index}"))?;
+    let (_, (leaf_script, leaf_version)) = input
+        .tap_scripts
+        .first_key_value()
+        .context("input has no tap_scripts entry")?;
+    let leaf_hash = TapLeafHash::from_script(leaf_script, *leaf_version);
+    let sighash = SighashCache::new(&psbt.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            input_index,
+            &Prevouts::All(&witness_utxos),
+            leaf_hash,
+            TapSighashType::Default,
+        )
+        .context("computing ark tx sighash")?;
+    Ok((
+        secp256k1::Message::from_digest(sighash.to_raw_hash().to_byte_array()),
+        leaf_hash,
+    ))
+}
+
+/// Check that `server_signed` is the server's co-signed copy of `local`.
+///
+/// Verifies that both carry the same unsigned transaction and that input 0
+/// carries a valid Schnorr signature from one of `server_keys` over the
+/// escrow leaf recorded in `local`. Returns the key that signed.
+///
+/// This is the client-side half of the protocol invariant: party checkpoint
+/// signatures are only released (via `finalize`) once the server has
+/// committed to the ark transaction that pays the parties out.
+pub fn verify_server_ark_tx_sig(
+    local: &Psbt,
+    server_signed: &Psbt,
+    server_keys: &[XOnlyPublicKey],
+) -> Result<XOnlyPublicKey> {
+    anyhow::ensure!(
+        server_signed.unsigned_tx == local.unsigned_tx,
+        "server returned a different ark transaction (local {}, server {})",
+        local.unsigned_tx.compute_txid(),
+        server_signed.unsigned_tx.compute_txid(),
+    );
+    let (msg, leaf_hash) = ark_tx_sighash(local, 0)?;
+    let input = server_signed
+        .inputs
+        .first()
+        .context("server ark tx has no inputs")?;
+    let secp = Secp256k1::verification_only();
+    for key in server_keys {
+        if let Some(sig) = input.tap_script_sigs.get(&(*key, leaf_hash)) {
+            secp.verify_schnorr(&sig.signature, &msg, key)
+                .with_context(|| format!("server signature by {key} is invalid"))?;
+            return Ok(*key);
+        }
+    }
+    anyhow::bail!(
+        "server did not co-sign the ark transaction (no signature by any of {} server keys on the escrow leaf)",
+        server_keys.len()
+    )
 }
 
 // --- Signature merging ---

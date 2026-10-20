@@ -487,6 +487,7 @@ impl EscrowClient {
                 .iter()
                 .map(|cps| cps.iter().map(psbt_to_base64).collect())
                 .collect(),
+            server_signed_ark_tx: None,
         };
 
         // Persist before the request leaves the process. If this fails,
@@ -605,7 +606,7 @@ impl EscrowClient {
         party_signed_checkpoints: &[&[Psbt]],
         first_attempt: bool,
     ) -> Result<Txid> {
-        let (ark_txid, server_checkpoints) = match self
+        let (ark_txid, server_signed_ark_tx, server_checkpoints) = match self
             .submit_internal(merged_ark_tx, unsigned_checkpoints)
             .await
         {
@@ -647,6 +648,7 @@ impl EscrowClient {
         // Upgrade the record: from here on a retry only needs to finalize.
         pending.stage = SpendStage::Submitted;
         pending.signed_checkpoints = final_checkpoints.iter().map(psbt_to_base64).collect();
+        pending.server_signed_ark_tx = Some(psbt_to_base64(&server_signed_ark_tx));
         pending.ark_tx = None;
         pending.unsigned_checkpoints.clear();
         pending.party_signed_checkpoints.clear();
@@ -885,23 +887,36 @@ impl EscrowClient {
 
     /// Submit a signed ark_tx + unsigned checkpoint PSBTs to the Arkade server.
     ///
-    /// Returns the ark txid and server-signed checkpoint PSBTs (with
-    /// witness_scripts restored).
+    /// Returns the ark txid, the server's co-signed ark tx (verified against
+    /// the submitted one and the server's known keys) and the server-signed
+    /// checkpoint PSBTs (with witness_scripts restored).
+    ///
+    /// The co-signature check is what keeps the protocol invariant: the
+    /// parties' checkpoint signatures must not reach the server (in
+    /// `finalize`) unless the server has committed to the ark tx that pays
+    /// them out. A server that returns checkpoints without a valid
+    /// co-signature gets nothing further; the pending record stays at
+    /// `submitting` for follow-up.
     async fn submit_internal(
         &self,
         ark_tx: Psbt,
         checkpoint_txs: Vec<Psbt>,
-    ) -> Result<(Txid, Vec<Psbt>)> {
+    ) -> Result<(Txid, Psbt, Vec<Psbt>)> {
         let ark_txid = ark_tx.unsigned_tx.compute_txid();
+        let server_keys = self.server_signing_keys()?;
 
         let res = Self::run_with_timeout(
             self.timeout,
             "submitting offchain transaction",
             self.grpc
-                .submit_offchain_transaction_request(ark_tx, checkpoint_txs.clone()),
+                .submit_offchain_transaction_request(ark_tx.clone(), checkpoint_txs.clone()),
         )
         .await
         .context("submitting offchain transaction")?;
+
+        let signed_by = spend::verify_server_ark_tx_sig(&ark_tx, &res.signed_ark_tx, &server_keys)
+            .context("verifying server co-signature on ark transaction")?;
+        tracing::debug!(%ark_txid, server_key = %signed_by, "Server co-signed ark transaction");
 
         // Build a map from original checkpoint txid → witness_script so we can
         // restore witness_script on the server-returned checkpoints (the server
@@ -927,7 +942,17 @@ impl EscrowClient {
             })
             .collect();
 
-        Ok((ark_txid, signed_checkpoints))
+        Ok((ark_txid, res.signed_ark_tx, signed_checkpoints))
+    }
+
+    /// The server keys a valid co-signature may come from: the active signer
+    /// plus any deprecated signers still announced in `/info`.
+    fn server_signing_keys(&self) -> Result<Vec<XOnlyPublicKey>> {
+        let info = self.server_info()?;
+        Ok(std::iter::once(info.signer_pk)
+            .chain(info.deprecated_signers.iter().map(|d| d.pk))
+            .map(|pk| pk.x_only_public_key().0)
+            .collect())
     }
 
     /// Finalize the offchain transaction with fully-signed checkpoint PSBTs.

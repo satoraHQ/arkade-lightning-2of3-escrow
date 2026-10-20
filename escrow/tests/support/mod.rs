@@ -49,6 +49,30 @@ pub enum Behavior {
     AcceptSpend,
     /// `SubmitTx` answers with gRPC `InvalidArgument`.
     RejectSubmit,
+    /// `SubmitTx` echoes the PSBTs back without co-signing the ark tx.
+    AcceptWithoutCosigning,
+}
+
+/// The fake server's signing key (its `signer_pubkey` in `GetInfo`).
+pub fn server_keypair() -> Keypair {
+    Keypair::from_seckey_slice(&Secp256k1::new(), &[7; 32]).unwrap()
+}
+
+/// Co-sign input 0 of a base64 ark tx PSBT the way arkd does.
+fn cosign_ark_tx(ark_tx_b64: &str) -> String {
+    use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
+    let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(ark_tx_b64).unwrap()).unwrap();
+    let (msg, leaf_hash) = ark_escrow::spend::ark_tx_sighash(&psbt, 0).unwrap();
+    let keypair = server_keypair();
+    let sig = Secp256k1::new().sign_schnorr_no_aux_rand(&msg, &keypair);
+    psbt.inputs[0].tap_script_sigs.insert(
+        (keypair.x_only_public_key().0, leaf_hash),
+        bitcoin::taproot::Signature {
+            signature: sig,
+            sighash_type: bitcoin::sighash::TapSighashType::Default,
+        },
+    );
+    STANDARD.encode(psbt.serialize())
 }
 
 #[derive(Message)]
@@ -135,9 +159,15 @@ impl RefreshServer {
                                         let _ = response.send_response(headers, true);
                                         return;
                                     }
+                                    let final_ark_tx =
+                                        if matches!(behavior, Behavior::AcceptWithoutCosigning) {
+                                            req.signed_ark_tx
+                                        } else {
+                                            cosign_ark_tx(&req.signed_ark_tx)
+                                        };
                                     SubmitTxResponse {
                                         ark_txid: String::new(),
-                                        final_ark_tx: req.signed_ark_tx,
+                                        final_ark_tx,
                                         signed_checkpoint_txs: req.checkpoint_txs,
                                     }
                                     .encode_to_vec()
@@ -168,7 +198,8 @@ impl RefreshServer {
                                         | Behavior::StallSubmit
                                         | Behavior::StallFinalize
                                         | Behavior::AcceptSpend
-                                        | Behavior::RejectSubmit => {}
+                                        | Behavior::RejectSubmit
+                                        | Behavior::AcceptWithoutCosigning => {}
                                     }
                                     RegisterIntentResponse {
                                         intent_id: "test-intent".to_owned(),
@@ -232,7 +263,7 @@ impl RefreshServer {
 
 fn server_info() -> GetInfoResponse {
     let secp = Secp256k1::new();
-    let key = Keypair::from_seckey_slice(&secp, &[7; 32]).unwrap();
+    let key = server_keypair();
     GetInfoResponse {
         version: "test".to_owned(),
         signer_pubkey: key.public_key().to_string(),

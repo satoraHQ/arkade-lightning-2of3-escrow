@@ -75,7 +75,8 @@ signatures can be collected before the Arkade server sees the checkpoints.
 8. **Buyer returns all signed PSBTs** to the arbiter
 9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, buyer_signed)`
 10. **Arbiter submits to Arkade** — `submit(merged_ark_tx, UNSIGNED_checkpoints)` via gRPC. **Only unsigned checkpoints are sent** — checkpoint signatures must not be revealed to the server before it co-signs the ark_tx.
-11. **Arkade returns server-signed checkpoints** — server adds its signatures to the checkpoints
+11. **Arkade returns the co-signed ark_tx and server-signed checkpoints** — server adds its signatures to both
+11a. **Arbiter verifies the server's co-signature** on the ark_tx against the submitted transaction and the server's announced keys (`verify_server_ark_tx_sig`). If it is missing or invalid, the flow stops here: no checkpoint signature is ever sent. The verified co-signed ark_tx is kept in the spend record.
 12. **Arbiter merges its checkpoint sigs** into the server-signed copies
 13. **Arbiter merges Buyer's checkpoint sigs** into the result
 14. **Arbiter finalizes** — `finalize(ark_txid, fully_signed_checkpoints)` via gRPC
@@ -85,9 +86,15 @@ signatures can be collected before the Arkade server sees the checkpoints.
 
 > Checkpoint signatures (arbiter's and Buyer's) are **never** sent to the
 > Arkade server before the server co-signs the ark_tx. The `submit` call
-> only includes unsigned checkpoints. This prevents the server from
-> broadcasting checkpoints unilaterally before committing to the ark
-> transaction.
+> only includes unsigned checkpoints, and `finalize` is only sent after the
+> server's co-signature on the ark_tx has been verified locally. This
+> prevents the server from broadcasting checkpoints unilaterally before
+> committing to the ark transaction.
+>
+> Arkade's one-shot submit (checkpoints sent fully signed in `submit`, server
+> finalizes in the same call) is deliberately **not** used for escrow spends:
+> it hands the server the checkpoint signatures before it has committed to
+> anything.
 
 ## Seller + Arbiter Flow
 

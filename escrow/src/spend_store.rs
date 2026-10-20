@@ -85,6 +85,11 @@ pub struct PendingSpend {
     /// [`SpendStage::Submitting`].
     #[serde(default)]
     pub party_signed_checkpoints: Vec<Vec<String>>,
+    /// The ark tx PSBT (base64) as co-signed by the server, verified. Present
+    /// from [`SpendStage::Submitted`] on. Kept so the parties hold the
+    /// server's commitment to the payout independently of `finalize`.
+    #[serde(default)]
+    pub server_signed_ark_tx: Option<String>,
 }
 
 impl PendingSpend {
@@ -270,6 +275,7 @@ mod tests {
             ark_tx: Some("psbt".to_string()),
             unsigned_checkpoints: vec!["cp".to_string()],
             party_signed_checkpoints: vec![vec!["a".to_string()], vec!["b".to_string()]],
+            server_signed_ark_tx: None,
         }
     }
 

@@ -57,6 +57,28 @@ fn psbt(seed: u8) -> Psbt {
     psbt
 }
 
+/// An ark tx PSBT with what the sighash needs: a witness_utxo and a taproot
+/// leaf on input 0, like `build_release_tx` produces.
+fn ark_tx_psbt() -> Psbt {
+    use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootMerkleBranch};
+    let mut psbt = psbt(1);
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: Amount::from_sat(2_000),
+        script_pubkey: ScriptBuf::new(),
+    });
+    let internal_key = support::server_keypair().x_only_public_key().0;
+    psbt.inputs[0].tap_scripts.insert(
+        ControlBlock {
+            leaf_version: LeafVersion::TapScript,
+            output_key_parity: bitcoin::key::Parity::Even,
+            internal_key,
+            merkle_branch: TaprootMerkleBranch::default(),
+        },
+        (ScriptBuf::from_bytes(vec![0x51]), LeafVersion::TapScript),
+    );
+    psbt
+}
+
 struct Spend {
     ark_tx: Psbt,
     checkpoints: Vec<Psbt>,
@@ -66,7 +88,7 @@ struct Spend {
 
 fn spend() -> Spend {
     Spend {
-        ark_tx: psbt(1),
+        ark_tx: ark_tx_psbt(),
         checkpoints: vec![psbt(2), psbt(3)],
         party_a: vec![psbt(2), psbt(3)],
         party_b: vec![psbt(2), psbt(3)],
@@ -153,6 +175,15 @@ async fn record_is_upgraded_after_submit_and_a_retry_only_finalizes() {
     assert_eq!(pending.signed_checkpoints.len(), 2);
     assert!(pending.ark_tx.is_none());
     assert!(pending.unsigned_checkpoints.is_empty());
+    let cosigned = ark_escrow::spend_store::psbt_from_base64(
+        pending
+            .server_signed_ark_tx
+            .as_deref()
+            .expect("server-signed ark tx kept"),
+    )
+    .unwrap();
+    assert_eq!(cosigned.unsigned_tx, spend().ark_tx.unsigned_tx);
+    assert_eq!(cosigned.inputs[0].tap_script_sigs.len(), 1);
 
     // A retry must not resubmit: the inputs are locked server-side.
     let _ = run(&client, &store, "trade").await.unwrap_err();
@@ -181,6 +212,7 @@ async fn successful_spend_removes_its_own_record_only() {
             ark_tx: None,
             unsigned_checkpoints: vec![],
             party_signed_checkpoints: vec![],
+            server_signed_ark_tx: None,
         })
         .unwrap();
     let submits_before = server.submit_requests.load(Ordering::SeqCst);
@@ -280,6 +312,7 @@ async fn definitive_rejection_on_resume_keeps_the_record() {
                 .map(ark_escrow::spend_store::psbt_to_base64)
                 .collect(),
             party_signed_checkpoints: vec![],
+            server_signed_ark_tx: None,
         })
         .unwrap();
 
@@ -323,6 +356,7 @@ async fn resume_pending_spend_finalizes_a_submitted_record_or_reports_none() {
             ark_tx: None,
             unsigned_checkpoints: vec![],
             party_signed_checkpoints: vec![],
+            server_signed_ark_tx: None,
         })
         .unwrap();
 
@@ -411,4 +445,22 @@ async fn submitted_stage_is_persisted_after_a_failed_finalize_even_if_the_first_
         "retried save kept the server sigs"
     );
     assert_eq!(pending.signed_checkpoints.len(), 2);
+}
+
+#[tokio::test]
+async fn missing_server_cosignature_withholds_finalize_and_keeps_the_record() {
+    let server = RefreshServer::start(Behavior::AcceptWithoutCosigning).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let error = run(&client, &store, "trade").await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("did not co-sign"),
+        "{error:#}"
+    );
+    // Party checkpoint signatures were never released.
+    assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
+    let pending = store.load("trade").unwrap().expect("record kept");
+    assert_eq!(pending.stage, SpendStage::Submitting);
+    assert!(pending.server_signed_ark_tx.is_none());
 }
