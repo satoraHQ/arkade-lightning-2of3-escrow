@@ -545,6 +545,17 @@ async fn a_deprecated_server_key_is_accepted_only_for_a_contract_that_names_it()
     let server = RefreshServer::start(Behavior::AcceptCosignedBy(DEPRECATED_SIGNER_SEED)).await;
     let client = connect(&server).await;
     let store = temp_store();
+
+    // The fake server really announces the deprecated signer (the test would
+    // otherwise pass for the wrong reason).
+    let info = client.server_info().unwrap();
+    assert_eq!(info.deprecated_signers.len(), 1);
+    assert_eq!(
+        info.deprecated_signers[0].pk,
+        support::keypair(DEPRECATED_SIGNER_SEED).public_key()
+    );
+    assert_eq!(info.deprecated_signers[0].cutoff_date, i64::MAX);
+    assert_eq!(info.signer_pk, support::server_keypair().public_key());
     run_spend(
         &client,
         &store,
@@ -640,6 +651,23 @@ async fn tampered_or_unverifiable_stored_evidence_is_not_finalized() {
         .await
         .unwrap_err();
     assert!(chain(&error).contains("did not co-sign"), "{error:#}");
+
+    // Genuine evidence, but checkpoints that are not inputs of that ark tx.
+    let stalled = RefreshServer::start(Behavior::StallFinalize).await;
+    let stalled_client = connect(&stalled).await;
+    let _ = run(&stalled_client, &store, "genuine").await.unwrap_err();
+    let mut genuine = store.load("genuine").unwrap().unwrap();
+    assert_eq!(genuine.stage, SpendStage::Submitted);
+    genuine.signed_checkpoints = vec![psbt_to_base64(&psbt(2))];
+    store.save(&genuine).unwrap();
+    let error = client
+        .resume_pending_spend(&store, "genuine")
+        .await
+        .unwrap_err();
+    assert!(
+        chain(&error).contains("not inputs of the recorded ark tx"),
+        "{error:#}"
+    );
 
     assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
     assert_eq!(

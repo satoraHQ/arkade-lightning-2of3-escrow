@@ -576,7 +576,6 @@ impl EscrowClient {
                 );
                 spend::verify_server_ark_tx_sig(&evidence, &evidence)
                     .context("re-verifying persisted server co-signature before finalize")?;
-                tracing::info!(%ark_txid, "Resuming finalization of pending spend");
 
                 let final_checkpoints: Vec<Psbt> = pending
                     .signed_checkpoints
@@ -584,6 +583,22 @@ impl EscrowClient {
                     .map(|b64| psbt_from_base64(b64))
                     .collect::<Result<_>>()
                     .context("decoding persisted checkpoint PSBTs")?;
+                // The ark tx spends the checkpoint outputs: every stored
+                // checkpoint must be one of its inputs, or the signatures
+                // about to be released belong to some other transaction.
+                anyhow::ensure!(
+                    !final_checkpoints.is_empty()
+                        && final_checkpoints.iter().all(|cp| {
+                            let cp_txid = cp.unsigned_tx.compute_txid();
+                            evidence
+                                .unsigned_tx
+                                .input
+                                .iter()
+                                .any(|i| i.previous_output.txid == cp_txid)
+                        }),
+                    "persisted checkpoints are not inputs of the recorded ark tx {ark_txid}"
+                );
+                tracing::info!(%ark_txid, "Resuming finalization of pending spend");
 
                 self.finalize_and_record(store, &pending, ark_txid, final_checkpoints)
                     .await

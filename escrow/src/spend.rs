@@ -246,6 +246,7 @@ pub fn verify_server_ark_tx_sig(local: &Psbt, server_signed: &Psbt) -> Result<Ps
         server_signed.unsigned_tx.compute_txid(),
     );
     let server_key = escrow_leaf_server_key(local, 0)?;
+    verify_leaf_commitment(local, 0)?;
     let (msg, leaf_hash) = ark_tx_sighash(local, 0)?;
     let input = server_signed
         .inputs
@@ -273,6 +274,42 @@ pub fn verify_server_ark_tx_sig(local: &Psbt, server_signed: &Psbt) -> Result<Ps
         .tap_script_sigs
         .insert((server_key, leaf_hash), *sig);
     Ok(canonical)
+}
+
+/// Check that the leaf recorded for `input_index` is actually committed to
+/// by the taproot output being spent (`witness_utxo`), i.e. the control
+/// block proves the leaf is part of that output's script tree. Without this
+/// a PSBT could name an arbitrary 3-key leaf whose "server key" is not the
+/// one that can spend the input.
+fn verify_leaf_commitment(psbt: &Psbt, input_index: usize) -> Result<()> {
+    let input = psbt
+        .inputs
+        .get(input_index)
+        .with_context(|| format!("no input at index {input_index}"))?;
+    let (control_block, (leaf_script, _)) = input
+        .tap_scripts
+        .first_key_value()
+        .context("input has no tap_scripts entry")?;
+    let spk = &input
+        .witness_utxo
+        .as_ref()
+        .context("input has no witness_utxo")?
+        .script_pubkey;
+    anyhow::ensure!(
+        spk.is_p2tr(),
+        "input {input_index} does not spend a taproot output"
+    );
+    let output_key =
+        XOnlyPublicKey::from_slice(&spk.as_bytes()[2..]).context("parsing taproot output key")?;
+    anyhow::ensure!(
+        control_block.verify_taproot_commitment(
+            &Secp256k1::verification_only(),
+            output_key,
+            leaf_script
+        ),
+        "escrow leaf is not committed to by the taproot output being spent"
+    );
+    Ok(())
 }
 
 /// The server key of the collaborative escrow leaf recorded for `input_index`.
@@ -326,11 +363,12 @@ pub fn merge_ark_tx_sigs(base: &mut Psbt, other: &Psbt) -> Result<()> {
 #[cfg(test)]
 mod verify_tests {
     use super::*;
-    use crate::contract::EscrowOptions;
-    use bitcoin::key::Parity;
+    use crate::contract::{EscrowContract, EscrowOptions};
     use bitcoin::secp256k1::rand;
-    use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootMerkleBranch};
-    use bitcoin::{ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction};
+    use bitcoin::taproot::LeafVersion;
+    use bitcoin::{
+        Network, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction,
+    };
 
     struct Fixture {
         local: Psbt,
@@ -350,6 +388,8 @@ mod verify_tests {
             server: server.x_only_public_key().0,
             unilateral_exit_delay: Sequence::from_height(10),
         };
+        let contract = EscrowContract::new(options.clone(), Network::Regtest).unwrap();
+        let leaf = options.buyer_arbiter_script();
         let mut local = Psbt::from_unsigned_tx(Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
@@ -367,16 +407,11 @@ mod verify_tests {
         .unwrap();
         local.inputs[0].witness_utxo = Some(TxOut {
             value: Amount::from_sat(2_000),
-            script_pubkey: ScriptBuf::new(),
+            script_pubkey: contract.script_pubkey(),
         });
         local.inputs[0].tap_scripts.insert(
-            ControlBlock {
-                leaf_version: LeafVersion::TapScript,
-                output_key_parity: Parity::Even,
-                internal_key: server.x_only_public_key().0,
-                merkle_branch: TaprootMerkleBranch::default(),
-            },
-            (options.buyer_arbiter_script(), LeafVersion::TapScript),
+            contract.control_block(&leaf).unwrap(),
+            (leaf, LeafVersion::TapScript),
         );
         sign_ark_tx(&mut local, &buyer).unwrap();
         sign_ark_tx(&mut local, &arbiter).unwrap();
@@ -449,6 +484,33 @@ mod verify_tests {
             format!("{err:#}").contains("different ark transaction"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn rejects_a_leaf_the_spent_output_does_not_commit_to() {
+        let f = fixture();
+        // Swap in a different 3-key leaf (other "server") with the original
+        // control block: the server key would be read from this leaf.
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let [a, b, fake_server] = std::array::from_fn(|_| Keypair::new(&secp, &mut rng));
+        let fake_leaf = EscrowOptions {
+            seller: a.x_only_public_key().0,
+            buyer: b.x_only_public_key().0,
+            arbiter: f.other.x_only_public_key().0,
+            server: fake_server.x_only_public_key().0,
+            unilateral_exit_delay: Sequence::from_height(10),
+        }
+        .buyer_arbiter_script();
+        let mut local = f.local.clone();
+        let (cb, _) = local.inputs[0].tap_scripts.pop_first().unwrap();
+        local.inputs[0]
+            .tap_scripts
+            .insert(cb, (fake_leaf, LeafVersion::TapScript));
+        let mut response = local.clone();
+        sign_ark_tx(&mut response, &fake_server).unwrap();
+        let err = verify_server_ark_tx_sig(&local, &response).unwrap_err();
+        assert!(format!("{err:#}").contains("not committed"), "{err:#}");
     }
 
     #[test]

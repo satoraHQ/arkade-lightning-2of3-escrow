@@ -208,8 +208,9 @@ co-signature and checkpoint signatures are in hand, marks it `finalized` after
 `finalize` succeeds, and deletes it only if the server definitively rejects the
 submit. Calling it again with the same `id`, or calling
 `resume_pending_spend(id)`, resumes from whatever stage was recorded; a
-finalized record returns its txid without a server call. The other arguments
-are ignored while a record exists. The record carries a `stage` (`submitting`,
+finalized record returns its txid without a server call. While a record exists
+the supplied `merged_ark_tx` must be the recorded transaction (same txid) and
+the remaining arguments are ignored. The record carries a `stage` (`submitting`,
 `submitted`, `finalized`), a random per-attempt `token`, and from `submitted` on
 the canonical co-signed ark tx (`server_signed_ark_tx`) and the fully-signed
 checkpoints.
@@ -254,7 +255,8 @@ A custom store must:
   they are not finalized automatically.
 
 Do not run two spends for the same `id` concurrently. The store is not a lock;
-the token only keeps a finished attempt from deleting another attempt's record.
+the token only keeps a finished attempt from deleting or overwriting another
+attempt's record, and only atomically if `remove_if`/`save_if` are implemented.
 
 ## End-to-end tests
 
