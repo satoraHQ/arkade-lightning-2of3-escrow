@@ -686,25 +686,32 @@ impl EscrowClient {
         result
     }
 
-    /// Whether `err` is a gRPC status from the server that rejects the
-    /// request outright, as opposed to a timeout, transport or server-side
-    /// failure where the request may still have been accepted.
+    /// Whether `err` is a gRPC status that proves the server rejected the
+    /// request without acting on it.
+    ///
+    /// Allowlist, not denylist: tonic also produces statuses on the client
+    /// side after a response was received (e.g. `OutOfRange` for an oversized
+    /// response, `Unimplemented` for unsupported compression), and those must
+    /// stay ambiguous. arkd reports every request rejection as
+    /// `InvalidArgument`; `FailedPrecondition` is its version/digest gate;
+    /// the auth codes are only ever produced before the request is handled.
     fn is_definitive_rejection(err: &anyhow::Error) -> bool {
         err.chain()
             .find_map(|cause| cause.downcast_ref::<tonic::Status>())
             .is_some_and(|status| {
-                !matches!(
+                matches!(
                     status.code(),
-                    tonic::Code::Unknown
-                        | tonic::Code::DeadlineExceeded
-                        | tonic::Code::ResourceExhausted
-                        | tonic::Code::Aborted
-                        | tonic::Code::Internal
-                        | tonic::Code::Unavailable
-                        | tonic::Code::DataLoss
-                        | tonic::Code::Cancelled
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::PermissionDenied
+                        | tonic::Code::Unauthenticated
                 )
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_definitive_rejection_for_test(err: &anyhow::Error) -> bool {
+        Self::is_definitive_rejection(err)
     }
 
     async fn finalize_and_clear(
@@ -992,6 +999,43 @@ mod tests {
 
     fn deprecated_signer(pk: bitcoin::secp256k1::PublicKey) -> server::DeprecatedSigner {
         server::DeprecatedSigner { pk, cutoff_date: 0 }
+    }
+
+    #[test]
+    fn only_server_side_rejection_codes_are_definitive() {
+        let wrapped =
+            |code| anyhow::Error::new(tonic::Status::new(code, "x")).context("submitting");
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+        ] {
+            assert!(
+                EscrowClient::is_definitive_rejection_for_test(&wrapped(code)),
+                "{code:?}"
+            );
+        }
+        for code in [
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+            tonic::Code::Ok,
+        ] {
+            assert!(
+                !EscrowClient::is_definitive_rejection_for_test(&wrapped(code)),
+                "{code:?}"
+            );
+        }
+        // No status at all (our own timeout) is ambiguous.
+        assert!(!EscrowClient::is_definitive_rejection_for_test(
+            &anyhow::anyhow!("submitting offchain transaction timed out after 50ms")
+        ));
     }
 
     #[test]
