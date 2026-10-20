@@ -113,6 +113,12 @@ fn parse_fee_outputs(fee_outputs: Vec<(String, u64)>) -> Result<Vec<FeeOutput>, 
 /// A [`SpendStore`] that delegates to a Ruby object responding to
 /// `save(id, json)`, `load(id) -> json|nil`, and `remove(id)`.
 ///
+/// If the object also responds to `remove_if(id, token) -> bool`, it is used
+/// for the compare-and-delete at the end of a spend; backends with a database
+/// should implement it as `DELETE ... WHERE id = ? AND (token = ? OR token
+/// IS NULL)`. Otherwise the non-atomic default (`load`, compare, `remove`)
+/// is used. `save` must be durable before it returns.
+///
 /// Uses [`Opaque`] so the Ruby value can be stored in a `Send + Sync` struct.
 struct CallbackSpendStore {
     /// The Ruby object wrapped in `Opaque` for thread-safety.
@@ -157,6 +163,28 @@ impl SpendStore for CallbackSpendStore {
             .funcall("remove", (id,))
             .map_err(|e| anyhow::anyhow!("Ruby store#remove failed: {e}"))?;
         Ok(())
+    }
+
+    fn remove_if(&self, id: &str, token: &str) -> anyhow::Result<bool> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let store = ruby.get_inner(self.rb_store);
+        let supported: bool = store
+            .funcall("respond_to?", ("remove_if",))
+            .map_err(|e| anyhow::anyhow!("Ruby store#respond_to? failed: {e}"))?;
+        if !supported {
+            // Non-atomic fallback: load, compare token, remove.
+            return match self.load(id)? {
+                Some(existing) if existing.token.is_empty() || existing.token == token => {
+                    self.remove(id)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            };
+        }
+        let removed: bool = store
+            .funcall("remove_if", (id, token))
+            .map_err(|e| anyhow::anyhow!("Ruby store#remove_if failed: {e}"))?;
+        Ok(removed)
     }
 }
 

@@ -1,5 +1,8 @@
+// Shared by several test binaries; each uses a subset of it.
+#![allow(dead_code)]
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ark_grpc::test_utils::GetInfoResponse;
@@ -15,6 +18,10 @@ use tokio::task::{JoinHandle, JoinSet};
 pub struct RefreshServer {
     pub url: String,
     pub stream_requested: Arc<AtomicBool>,
+    /// Number of `SubmitTx` requests received.
+    pub submit_requests: Arc<AtomicUsize>,
+    /// Number of `FinalizeTx` requests received.
+    pub finalize_requests: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
@@ -30,6 +37,43 @@ pub enum Behavior {
     StallInfo,
     StallRegistration,
     StallStream,
+    /// `SubmitTx` never answers. The client cannot tell whether it was
+    /// accepted.
+    StallSubmit,
+    /// `SubmitTx` echoes the submitted PSBTs back as "signed"; `FinalizeTx`
+    /// never answers.
+    StallFinalize,
+    /// `SubmitTx` echoes the submitted PSBTs back; `FinalizeTx` succeeds.
+    AcceptSpend,
+}
+
+#[derive(Message)]
+struct SubmitTxRequest {
+    #[prost(string, tag = "1")]
+    signed_ark_tx: String,
+    #[prost(string, repeated, tag = "2")]
+    checkpoint_txs: Vec<String>,
+}
+
+#[derive(Message)]
+struct SubmitTxResponse {
+    #[prost(string, tag = "1")]
+    ark_txid: String,
+    #[prost(string, tag = "2")]
+    final_ark_tx: String,
+    #[prost(string, repeated, tag = "3")]
+    signed_checkpoint_txs: Vec<String>,
+}
+
+/// Read a unary gRPC request body and strip the 5-byte length prefix.
+async fn read_grpc_message(body: &mut h2::RecvStream) -> Bytes {
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        let _ = body.flow_control().release_capacity(chunk.len());
+        buf.extend_from_slice(&chunk);
+    }
+    buf.split_off(5).freeze()
 }
 
 #[derive(Message)]
@@ -45,12 +89,18 @@ impl RefreshServer {
         let info = server_info().encode_to_vec();
         let stream_requested = Arc::new(AtomicBool::new(false));
         let stream_observed = stream_requested.clone();
+        let submit_requests = Arc::new(AtomicUsize::new(0));
+        let submit_counter = submit_requests.clone();
+        let finalize_requests = Arc::new(AtomicUsize::new(0));
+        let finalize_counter = finalize_requests.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let info = info.clone();
                 let stream_observed = stream_observed.clone();
+                let submit_counter = submit_counter.clone();
+                let finalize_counter = finalize_counter.clone();
                 connections.spawn(async move {
                     let mut connection = h2::server::handshake(socket).await.unwrap();
                     let mut requests = JoinSet::new();
@@ -58,8 +108,33 @@ impl RefreshServer {
                         let (request, mut response) = request.unwrap();
                         let info = info.clone();
                         let stream_observed = stream_observed.clone();
+                        let submit_counter = submit_counter.clone();
+                        let finalize_counter = finalize_counter.clone();
                         requests.spawn(async move {
-                            let payload = match request.uri().path() {
+                            let (parts, mut body) = request.into_parts();
+                            let payload = match parts.uri.path() {
+                                "/ark.v1.ArkService/SubmitTx" => {
+                                    submit_counter.fetch_add(1, Ordering::SeqCst);
+                                    let req =
+                                        SubmitTxRequest::decode(read_grpc_message(&mut body).await)
+                                            .unwrap();
+                                    if matches!(behavior, Behavior::StallSubmit) {
+                                        std::future::pending::<()>().await;
+                                    }
+                                    SubmitTxResponse {
+                                        ark_txid: String::new(),
+                                        final_ark_tx: req.signed_ark_tx,
+                                        signed_checkpoint_txs: req.checkpoint_txs,
+                                    }
+                                    .encode_to_vec()
+                                }
+                                "/ark.v1.ArkService/FinalizeTx" => {
+                                    finalize_counter.fetch_add(1, Ordering::SeqCst);
+                                    if matches!(behavior, Behavior::StallFinalize) {
+                                        std::future::pending::<()>().await;
+                                    }
+                                    Vec::new()
+                                }
                                 "/ark.v1.ArkService/GetInfo" => {
                                     if matches!(behavior, Behavior::StallInfo) {
                                         std::future::pending::<()>().await;
@@ -74,7 +149,11 @@ impl RefreshServer {
                                         Behavior::StallRegistration => {
                                             std::future::pending::<()>().await;
                                         }
-                                        Behavior::StallStream | Behavior::StallInfo => {}
+                                        Behavior::StallStream
+                                        | Behavior::StallInfo
+                                        | Behavior::StallSubmit
+                                        | Behavior::StallFinalize
+                                        | Behavior::AcceptSpend => {}
                                     }
                                     RegisterIntentResponse {
                                         intent_id: "test-intent".to_owned(),
@@ -129,6 +208,8 @@ impl RefreshServer {
         Self {
             url,
             stream_requested,
+            submit_requests,
+            finalize_requests,
             task,
         }
     }
