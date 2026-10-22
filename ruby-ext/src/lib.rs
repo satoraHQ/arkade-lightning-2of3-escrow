@@ -302,12 +302,7 @@ impl RbClient {
             &["timeout_ms", "refresh_timeout_ms"],
         )?;
         let (timeout_ms, refresh_timeout_ms) = kwargs.optional;
-        Self::with_file_store_inner(
-            url,
-            store_dir,
-            timeout_ms.and_then(timeout_from_ms),
-            refresh_timeout_ms,
-        )
+        Self::with_file_store_inner(url, store_dir, timeout_ms, refresh_timeout_ms)
     }
 
     fn with_file_store_timeout(
@@ -315,19 +310,21 @@ impl RbClient {
         store_dir: String,
         timeout_ms: u64,
     ) -> Result<Self, Error> {
-        Self::with_file_store_inner(url, store_dir, timeout_from_ms(timeout_ms), None)
+        Self::with_file_store_inner(url, store_dir, Some(timeout_ms), None)
     }
 
     fn with_file_store_inner(
         url: String,
         store_dir: String,
-        timeout: Option<Duration>,
+        timeout_ms: Option<u64>,
         refresh_timeout_ms: Option<u64>,
     ) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = FileSpendStore::new(&store_dir).map_err(to_magnus_err)?;
         let mut client = EscrowClient::new(&url);
-        client.set_timeout(timeout);
+        if let Some(timeout_ms) = timeout_ms {
+            client.set_timeout(timeout_from_ms(timeout_ms));
+        }
         if let Some(timeout_ms) = refresh_timeout_ms {
             client.set_refresh_timeout(timeout_from_ms(timeout_ms));
         }
@@ -363,12 +360,7 @@ impl RbClient {
             &["timeout_ms", "refresh_timeout_ms"],
         )?;
         let (timeout_ms, refresh_timeout_ms) = kwargs.optional;
-        Self::with_custom_store_inner(
-            url,
-            rb_store,
-            timeout_ms.and_then(timeout_from_ms),
-            refresh_timeout_ms,
-        )
+        Self::with_custom_store_inner(url, rb_store, timeout_ms, refresh_timeout_ms)
     }
 
     fn with_custom_store_timeout(
@@ -376,19 +368,21 @@ impl RbClient {
         rb_store: magnus::Value,
         timeout_ms: u64,
     ) -> Result<Self, Error> {
-        Self::with_custom_store_inner(url, rb_store, timeout_from_ms(timeout_ms), None)
+        Self::with_custom_store_inner(url, rb_store, Some(timeout_ms), None)
     }
 
     fn with_custom_store_inner(
         url: String,
         rb_store: magnus::Value,
-        timeout: Option<Duration>,
+        timeout_ms: Option<u64>,
         refresh_timeout_ms: Option<u64>,
     ) -> Result<Self, Error> {
         let rt = Runtime::new().map_err(to_magnus_err)?;
         let store = CallbackSpendStore::new(rb_store);
         let mut client = EscrowClient::new(&url);
-        client.set_timeout(timeout);
+        if let Some(timeout_ms) = timeout_ms {
+            client.set_timeout(timeout_from_ms(timeout_ms));
+        }
         if let Some(timeout_ms) = refresh_timeout_ms {
             client.set_refresh_timeout(timeout_from_ms(timeout_ms));
         }

@@ -49,7 +49,21 @@ pub struct EscrowClient {
     refresh_timeout: Option<Duration>,
 }
 
+/// Default timeout for Arkade network operations other than refresh.
+///
+/// Long enough for a `submit`/`finalize` round-trip on a loaded server,
+/// short enough that a hung connection does not block a release forever.
+/// Callers that pick their own value should keep it well above the server's
+/// typical `submit` latency: a timeout that fires after the server has
+/// accepted a submit is the one case the spend store cannot recover from
+/// without operator help.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default overall deadline for a refresh batch ceremony.
+pub const DEFAULT_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl EscrowClient {
+    /// Create a client with [`DEFAULT_TIMEOUT`] and [`DEFAULT_REFRESH_TIMEOUT`].
     pub fn new(url: &str) -> Self {
         let server_info = Arc::new(RwLock::new(None));
         let mut grpc = ark_grpc::Client::new(url.to_string());
@@ -68,8 +82,8 @@ impl EscrowClient {
         Self {
             grpc,
             server_info,
-            timeout: None,
-            refresh_timeout: Some(Duration::from_secs(120)),
+            timeout: Some(DEFAULT_TIMEOUT),
+            refresh_timeout: Some(DEFAULT_REFRESH_TIMEOUT),
         }
     }
 
@@ -79,9 +93,9 @@ impl EscrowClient {
         client
     }
 
-    /// Set the timeout applied to Arkade network operations other than refresh.
-    /// `None` disables this timeout. Refresh has its own ceremony deadline; see
-    /// [`Self::set_refresh_timeout`].
+    /// Set the timeout applied to Arkade network operations other than refresh
+    /// (default: [`DEFAULT_TIMEOUT`]). `None` disables this timeout. Refresh
+    /// has its own ceremony deadline; see [`Self::set_refresh_timeout`].
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
     }
@@ -1077,6 +1091,13 @@ mod tests {
 
     fn deprecated_signer(pk: bitcoin::secp256k1::PublicKey) -> server::DeprecatedSigner {
         server::DeprecatedSigner { pk, cutoff_date: 0 }
+    }
+
+    #[test]
+    fn new_client_has_bounded_timeouts_by_default() {
+        let client = EscrowClient::new("http://localhost:7070");
+        assert_eq!(client.timeout(), Some(DEFAULT_TIMEOUT));
+        assert_eq!(client.refresh_timeout(), Some(DEFAULT_REFRESH_TIMEOUT));
     }
 
     #[test]
