@@ -14,8 +14,21 @@ use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::contract::{EscrowContract, SignerSet};
+
+/// How long the `delete` intent proof built by [`prepare_refresh`] stays
+/// valid. Long enough to cover retries of a refresh, short enough that the
+/// authority it grants (cancelling queued intents over these inputs) does
+/// not outlive the trade.
+pub const DELETE_PROOF_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often, and how long, to retry deleting a stale intent that arkd
+/// reports as absent. An intent taken into a running batch is not queued
+/// while that batch runs and is queued again if the batch fails.
+pub const STALE_INTENT_DELETE_ATTEMPTS: u32 = 6;
+pub const STALE_INTENT_DELETE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Everything needed to describe an escrow VTXO for refresh.
 #[derive(Debug, Clone)]
@@ -40,9 +53,13 @@ pub struct RefreshIntent {
     /// Used to clear a queued intent left behind by an earlier attempt that
     /// never joined a batch (the server answers "already registered" at
     /// registration), and to withdraw this attempt's own intent if the
-    /// ceremony fails or times out. Its `expire_at` is 0, so it stays valid
-    /// until used. `None` for callers that have not adopted it; then stale
-    /// intents are left for the server to drop.
+    /// ceremony fails or times out.
+    ///
+    /// Whoever holds the signed proof can cancel any queued intent spending
+    /// these inputs, repeatedly, until the proof's `expire_at`
+    /// ([`DELETE_PROOF_VALIDITY`] after preparation). It cannot move funds.
+    /// `None` for callers that have not adopted it; then stale intents are
+    /// left for the server to drop.
     pub delete_intent: Option<intent::Intent>,
 }
 
@@ -65,8 +82,14 @@ impl RefreshIntent {
     }
 }
 
-/// Build the unsigned `delete` intent proof for `intent_inputs`.
+/// Build the unsigned `delete` intent proof for `intent_inputs`, valid for
+/// [`DELETE_PROOF_VALIDITY`] from now.
 fn prepare_delete_intent(intent_inputs: Vec<intent::Input>) -> Result<intent::Intent> {
+    let expire_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .saturating_add(DELETE_PROOF_VALIDITY)
+        .as_secs();
     // `make_intent` decorates and signs in one go; signing closures that
     // return nothing leave an unsigned but fully decorated proof, which
     // `sign_refresh` then signs the same way as the register proof.
@@ -79,7 +102,7 @@ fn prepare_delete_intent(intent_inputs: Vec<intent::Input>) -> Result<intent::In
         },
         intent_inputs,
         vec![],
-        intent::IntentMessage::Delete { expire_at: 0 },
+        intent::IntentMessage::Delete { expire_at },
     )
     .map_err(|e| anyhow::anyhow!("{e:#}"))
     .context("preparing delete intent")
@@ -208,17 +231,34 @@ pub fn sign_delete_intent_proof(proof: &mut Psbt, keypair: &Keypair) -> Result<(
 }
 
 /// Ask the server to drop every queued intent that spends an input of
-/// `delete_intent`. Succeeds when nothing was queued.
-pub async fn delete_intent(grpc: &ark_grpc::Client, delete_intent: intent::Intent) -> Result<()> {
-    match grpc.delete_intent(delete_intent).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let e = anyhow::anyhow!("{e:#}");
-            if is_no_matching_intent_error(&e) {
-                tracing::debug!("No queued intent to delete");
-                Ok(())
-            } else {
-                Err(e.context("deleting intent"))
+/// `delete_intent`.
+///
+/// Returns `Ok(true)` if something was deleted and `Ok(false)` if nothing
+/// was queued after `max_attempts` tries ([`STALE_INTENT_DELETE_RETRY_DELAY`]
+/// apart). An intent inside a running batch is not queued while that batch
+/// runs; arkd queues it again if the batch fails, so "nothing queued" is not
+/// proof the intent is gone.
+pub async fn delete_intent(
+    grpc: &ark_grpc::Client,
+    delete_intent: intent::Intent,
+    max_attempts: u32,
+) -> Result<bool> {
+    let mut attempt = 1;
+    loop {
+        match grpc.delete_intent(delete_intent.clone()).await {
+            Ok(()) => return Ok(true),
+            Err(e) => {
+                let e = anyhow::anyhow!("{e:#}");
+                if !is_no_matching_intent_error(&e) {
+                    return Err(e.context("deleting intent"));
+                }
+                if attempt >= max_attempts {
+                    tracing::debug!(attempt, "No queued intent to delete");
+                    return Ok(false);
+                }
+                tracing::debug!(attempt, "No queued intent to delete yet; retrying");
+                attempt += 1;
+                tokio::time::sleep(STALE_INTENT_DELETE_RETRY_DELAY).await;
             }
         }
     }
@@ -255,7 +295,7 @@ pub async fn execute_refresh<R: Rng + CryptoRng>(
                 error = %e,
                 "An input is held by a stale intent; deleting it and retrying registration"
             );
-            delete_intent(grpc, delete)
+            delete_intent(grpc, delete, STALE_INTENT_DELETE_ATTEMPTS)
                 .await
                 .context("deleting the stale intent holding the refresh inputs")?;
             #[allow(deprecated)]

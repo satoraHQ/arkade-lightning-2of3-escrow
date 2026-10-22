@@ -42,8 +42,14 @@ fn refresh_intent(with_delete: bool) -> (RefreshIntent, Keypair) {
         ),
         forfeit_psbts: vec![],
         refresh_cosigner_pk: cosigner.public_key(),
-        delete_intent: with_delete
-            .then(|| Intent::new(empty_proof(), IntentMessage::Delete { expire_at: 0 })),
+        delete_intent: with_delete.then(|| {
+            Intent::new(
+                empty_proof(),
+                IntentMessage::Delete {
+                    expire_at: u64::MAX,
+                },
+            )
+        }),
     };
     (refresh, cosigner)
 }
@@ -91,5 +97,52 @@ async fn a_timed_out_ceremony_withdraws_its_intent() {
     let error = client.refresh_escrow(refresh, cosigner).await.unwrap_err();
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     assert_eq!(server.register_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.delete_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_stale_intent_inside_a_running_batch_is_deleted_on_a_later_try() {
+    let server = RefreshServer::start(Behavior::StaleIntentNoMatchOnce).await;
+    let client = connect(&server).await;
+    let (refresh, cosigner) = refresh_intent(true);
+
+    let error = client.refresh_escrow(refresh, cosigner).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("refresh reached event stream"),
+        "{error:#}"
+    );
+    assert_eq!(server.register_requests.load(Ordering::SeqCst), 2);
+    // no-match, then deleted, then the withdrawal after the stream error.
+    assert_eq!(server.delete_requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn a_failed_withdrawal_does_not_mask_the_ceremony_error() {
+    let server = RefreshServer::start(Behavior::StallStreamDeleteFails).await;
+    let mut client = connect(&server).await;
+    client.set_refresh_timeout(Some(Duration::from_millis(200)));
+    let (refresh, cosigner) = refresh_intent(true);
+
+    let error = client.refresh_escrow(refresh, cosigner).await.unwrap_err();
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    assert!(!format!("{error:#}").contains("boom"), "{error:#}");
+    assert_eq!(server.delete_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn withdrawal_is_bounded_even_when_the_request_timeout_is_disabled() {
+    let server = RefreshServer::start(Behavior::StallStream).await;
+    let mut client = connect(&server).await;
+    client.set_timeout(None);
+    client.set_refresh_timeout(Some(Duration::from_millis(200)));
+    let (refresh, cosigner) = refresh_intent(true);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.refresh_escrow(refresh, cosigner),
+    )
+    .await
+    .expect("cleanup must not hang")
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     assert_eq!(server.delete_requests.load(Ordering::SeqCst), 1);
 }

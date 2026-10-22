@@ -57,7 +57,14 @@ async fn refresh_clears_a_stale_intent_left_by_an_abandoned_attempt() -> Result<
             cosigner.public_key(),
         )
         .await?;
-    assert!(fresh.delete_intent.is_some());
+    let delete = fresh.delete_intent.as_ref().expect("delete proof prepared");
+    let message: serde_json::Value = serde_json::from_str(&delete.serialize_message()?)?;
+    assert_eq!(message["type"], "delete");
+    let expire_at = message["expire_at"].as_u64().expect("expire_at");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    assert!(expire_at > now && expire_at <= now + 24 * 60 * 60 + 60);
     refresh::sign_refresh(&mut fresh, &escrow.parties.buyer)?;
     refresh::sign_refresh(&mut fresh, &escrow.parties.arbiter)?;
 
@@ -75,6 +82,9 @@ async fn refresh_clears_a_stale_intent_left_by_an_abandoned_attempt() -> Result<
         "unexpected rejection text: {rejected:#}"
     );
 
+    // arkd refuses to register while the stale intent is queued (asserted
+    // above), so a successful refresh is only possible if the client deleted
+    // it first.
     client
         .refresh_escrow(fresh, cosigner)
         .await

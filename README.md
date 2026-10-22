@@ -175,25 +175,36 @@ or `None` to disable it. In Ruby, both store constructors accept
 it. Changing `timeout_ms` does not change the refresh deadline.
 
 A timeout stops the local wait and does not prove that the batch failed. With a
-signed delete proof (fifth value from `prepare_refresh`, signed alongside the
-intent by the same parties) the client withdraws its intent after a failed or
-timed-out ceremony, and clears a stale intent left by an earlier attempt before
-registering ("already registered"). Without it, stale intents are left for the
-server to drop. `delete_refresh_intent(signed_delete)` does the cleanup by hand.
-The delete proof has no expiry; keep it with the trade until the refresh is done.
+signed delete proof (fifth and sixth values from `prepare_refresh`, signed
+alongside the intent by the same parties) the client clears a stale intent left
+by an earlier attempt before registering ("already registered", retried for up
+to 30 s while the stale intent may be inside a running batch), and makes one
+attempt to withdraw its own intent after a failed or timed-out ceremony. That
+withdrawal is best effort and takes up to one ordinary request timeout on top of
+the refresh deadline; an intent inside a running batch is not queued at that
+moment and is cleared by the next attempt instead. Without the proof, stale
+intents are left for the server to drop.
+`delete_refresh_intent(signed_delete, delete_message_json)` does the cleanup by
+hand and returns whether anything was queued.
+
+The delete proof is valid for 24 hours from `prepare_refresh`. Whoever holds the
+signed proof can cancel any queued intent over those inputs during that time, as
+often as they like. It cannot move funds. Treat it like the other signed
+refresh material: keep it with the trade, do not hand it to third parties.
 
 ```ruby
 # Check VTXO status
 pending, vtxos, any_recoverable = client.get_escrow_vtxo_status(trade_id, contract)
 
 # Prepare + sign + refresh using the selected signer set.
-intent_b64, message_json, forfeit_b64s, cosigner_pk, delete_b64 =
+intent_b64, message_json, forfeit_b64s, cosigner_pk, delete_b64, delete_message_json =
   client.prepare_refresh(contract, vtxos, "buyer_arbiter", cosigner_sk)
 
 signed_intent, signed_forfeits, signed_delete =
   ArkEscrow.sign_refresh(intent_b64, forfeit_b64s, buyer_sk, delete_b64)
 # ... merge arbiter + buyer sigs (intent, forfeits and delete proof), then:
-txid = client.refresh_escrow(signed_intent, message_json, signed_forfeits, cosigner_sk, signed_delete)
+txid = client.refresh_escrow(signed_intent, message_json, signed_forfeits, cosigner_sk,
+                             signed_delete, delete_message_json)
 
 # Once the refreshed VTXO is visible/spendable, use build_release/build_refund.
 outpoint, amount = client.find_escrow_vtxo(contract)

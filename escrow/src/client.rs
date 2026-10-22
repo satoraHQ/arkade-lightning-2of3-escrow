@@ -378,10 +378,16 @@ impl EscrowClient {
 
         // A failed or timed-out ceremony may leave this attempt's intent
         // queued on the server, holding the inputs. Withdraw it so the next
-        // attempt does not start with "already registered".
+        // attempt does not start with "already registered". Best effort and
+        // single-shot: an intent inside a running batch is not queued now
+        // and comes back if that batch fails; the next attempt handles that.
         if let (Err(_), Some(delete)) = (&result, delete) {
             match self.delete_refresh_intent(delete).await {
-                Ok(()) => tracing::info!("Withdrew refresh intent after failed ceremony"),
+                Ok(true) => tracing::info!("Withdrew refresh intent after failed ceremony"),
+                Ok(false) => tracing::info!(
+                    "No queued refresh intent to withdraw after failed ceremony \
+                     (it may be inside a running batch)"
+                ),
                 Err(e) => tracing::warn!(
                     error = %e,
                     "Could not withdraw refresh intent after failed ceremony; \
@@ -393,16 +399,18 @@ impl EscrowClient {
     }
 
     /// Delete queued intents that spend the inputs of a `delete` intent
-    /// (see [`RefreshIntent::delete_intent`]). Succeeds when nothing was
-    /// queued. Bounded by the ordinary request timeout.
+    /// (see [`RefreshIntent::delete_intent`]). Returns whether anything was
+    /// deleted; `Ok(false)` means nothing was queued at that moment. One
+    /// attempt, bounded by the ordinary request timeout (or
+    /// [`DEFAULT_TIMEOUT`] if that is disabled).
     pub async fn delete_refresh_intent(
         &self,
         delete_intent: ark_core::intent::Intent,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         Self::run_with_timeout(
-            self.timeout,
+            Some(self.timeout.unwrap_or(DEFAULT_TIMEOUT)),
             "deleting refresh intent",
-            crate::refresh::delete_intent(&self.grpc, delete_intent),
+            crate::refresh::delete_intent(&self.grpc, delete_intent, 1),
         )
         .await
     }

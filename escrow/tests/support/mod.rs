@@ -64,6 +64,11 @@ pub enum Behavior {
     /// The first `RegisterIntent` answers "already registered"; later ones
     /// succeed. The event stream then ends the ceremony with an error.
     StaleIntentOnce,
+    /// Like `StaleIntentOnce`, but the first `DeleteIntent` answers "no
+    /// matching intents found" (the stale intent is inside a running batch).
+    StaleIntentNoMatchOnce,
+    /// The event stream stalls and every `DeleteIntent` fails.
+    StallStreamDeleteFails,
 }
 
 /// Seed of the fake server's active signer key (`signer_pubkey` in `GetInfo`).
@@ -241,7 +246,27 @@ impl RefreshServer {
                                     info
                                 }
                                 "/ark.v1.ArkService/DeleteIntent" => {
-                                    delete_counter.fetch_add(1, Ordering::SeqCst);
+                                    let n = delete_counter.fetch_add(1, Ordering::SeqCst);
+                                    let failure = match behavior {
+                                        Behavior::StaleIntentNoMatchOnce if n == 0 => Some((
+                                            "3",
+                                            "INVALID_INTENT_PROOF (2): no matching intents found for intent proof",
+                                        )),
+                                        Behavior::StallStreamDeleteFails => {
+                                            Some(("13", "INTERNAL_ERROR (0): boom"))
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some((code, message)) = failure {
+                                        let headers = http::Response::builder()
+                                            .header("content-type", "application/grpc")
+                                            .header("grpc-status", code)
+                                            .header("grpc-message", message)
+                                            .body(())
+                                            .unwrap();
+                                        let _ = response.send_response(headers, true);
+                                        return;
+                                    }
                                     Vec::new()
                                 }
                                 "/ark.v1.ArkService/RegisterIntent" => {
@@ -253,7 +278,10 @@ impl RefreshServer {
                                         Behavior::StallRegistration => {
                                             std::future::pending::<()>().await;
                                         }
-                                        Behavior::StaleIntentOnce if n == 0 => {
+                                        Behavior::StaleIntentOnce
+                                        | Behavior::StaleIntentNoMatchOnce
+                                            if n == 0 =>
+                                        {
                                             let headers = http::Response::builder()
                                                 .header("content-type", "application/grpc")
                                                 .header("grpc-status", "3")
@@ -275,7 +303,10 @@ impl RefreshServer {
                                 }
                                 "/ark.v1.ArkService/GetEventStream" => {
                                     stream_observed.store(true, Ordering::SeqCst);
-                                    if matches!(behavior, Behavior::StallStream) {
+                                    if matches!(
+                                        behavior,
+                                        Behavior::StallStream | Behavior::StallStreamDeleteFails
+                                    ) {
                                         let headers = http::Response::builder()
                                             .header("content-type", "application/grpc")
                                             .body(())
