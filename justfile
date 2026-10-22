@@ -14,12 +14,27 @@ test:
 
 ci: fmt-check clippy test
 
+# Build the Ruby extension and the symlink `lib/ark_escrow.rb` loads.
+build-ruby:
+    #!/usr/bin/env sh
+    set -e
+    cargo build -p ark-escrow-ruby
+    case "$(uname -s)" in
+      Darwin) ln -sf libark_escrow_ruby.dylib target/debug/ark_escrow_ruby.bundle ;;
+      *)      ln -sf libark_escrow_ruby.so target/debug/ark_escrow_ruby.so ;;
+    esac
+
 # End-to-end tests against a running arkade-regtest stack. Defaults to the
 # `regtest` submodule; override REGTEST_DIR to point elsewhere.
 # Bring the stack up first: `just regtest-up`.
-e2e:
+e2e: e2e-rust e2e-ruby
+
+e2e-rust:
     REGTEST_DIR="$(realpath "${REGTEST_DIR:-regtest}")" && test -f "$REGTEST_DIR/regtest.mjs" || (echo "regtest.mjs not found; run: git submodule update --init" >&2; exit 1)
-    REGTEST_DIR="$(realpath "${REGTEST_DIR:-regtest}")" cargo test -p ark-escrow --test signer_rotation -- --ignored --test-threads=1 --nocapture
+    REGTEST_DIR="$(realpath "${REGTEST_DIR:-regtest}")" cargo test -p ark-escrow -- --ignored --test-threads=1 --nocapture
+
+e2e-ruby: build-ruby
+    REGTEST_DIR="$(realpath "${REGTEST_DIR:-regtest}")" ruby ruby-ext/e2e/release.rb
 
 regtest-up:
     node regtest/regtest.mjs start --env .env.regtest --profile ark
@@ -28,4 +43,4 @@ regtest-down:
     node regtest/regtest.mjs clean
 
 # Kept for compatibility.
-signer-rotation-e2e: e2e
+signer-rotation-e2e: e2e-rust

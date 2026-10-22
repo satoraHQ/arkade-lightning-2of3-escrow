@@ -1,6 +1,8 @@
 // Shared by several test binaries; each uses a subset of it.
 #![allow(dead_code)]
 
+pub mod regtest;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;

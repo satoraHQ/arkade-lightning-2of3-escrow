@@ -239,7 +239,10 @@ the token only keeps a finished attempt from deleting another attempt's record.
 
 ## End-to-end tests
 
-`escrow/tests/signer_rotation.rs` runs against a real arkd. The stack comes from
+`escrow/tests/e2e_spend.rs` (release, refund, lost submit response, resume
+after crash), `escrow/tests/signer_rotation.rs` (refresh and spend across a
+server signer rotation) and `ruby-ext/e2e/release.rb` (the gem, end to end)
+run against a real arkd. The stack comes from
 the public [arkade-regtest](https://github.com/ArkLabsHQ/arkade-regtest)
 submodule and the public arkd container image pinned in `.env.regtest`; no
 secrets or private repositories are involved, so forks can run it unchanged.
@@ -247,7 +250,7 @@ secrets or private repositories are involved, so forks can run it unchanged.
 ```bash
 git submodule update --init   # once
 just regtest-up               # Bitcoin Core + Fulcrum + arkd, ~1 min
-just e2e
+just e2e                      # e2e-rust + e2e-ruby
 just regtest-down
 ```
 
