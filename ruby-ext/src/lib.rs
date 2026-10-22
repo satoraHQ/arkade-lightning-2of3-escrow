@@ -4,7 +4,7 @@ use std::time::Duration;
 use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
 use ark_escrow::refresh::{RefreshIntent, RefreshVtxo};
-use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStore};
+use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStage, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
@@ -113,11 +113,18 @@ fn parse_fee_outputs(fee_outputs: Vec<(String, u64)>) -> Result<Vec<FeeOutput>, 
 /// A [`SpendStore`] that delegates to a Ruby object responding to
 /// `save(id, json)`, `load(id) -> json|nil`, and `remove(id)`.
 ///
-/// If the object also responds to `remove_if(id, token) -> bool`, it is used
-/// for the compare-and-delete at the end of a spend; backends with a database
-/// should implement it as `DELETE ... WHERE id = ? AND (token = ? OR token
-/// IS NULL)`. Otherwise the non-atomic default (`load`, compare, `remove`)
-/// is used. `save` must be durable before it returns.
+/// Two optional methods let a database-backed store make the token checks
+/// atomic; without them the non-atomic defaults (`load`, compare, write) are
+/// used:
+///
+/// - `remove_if(id, token) -> bool`: compare-and-delete, used to clear a
+///   record the server definitively rejected
+///   (`DELETE ... WHERE id = ? AND (token = ? OR token IS NULL)`).
+/// - `save_if(id, json, token) -> bool`: compare-and-overwrite, used to mark a
+///   record finalized (`UPDATE ... SET json = ? WHERE id = ? AND (token = ?
+///   OR token IS NULL)`).
+///
+/// `save` must be durable before it returns.
 ///
 /// Uses [`Opaque`] so the Ruby value can be stored in a `Send + Sync` struct.
 struct CallbackSpendStore {
@@ -185,6 +192,31 @@ impl SpendStore for CallbackSpendStore {
             .funcall("remove_if", (id, token))
             .map_err(|e| anyhow::anyhow!("Ruby store#remove_if failed: {e}"))?;
         Ok(removed)
+    }
+
+    fn save_if(&self, spend: &PendingSpend) -> anyhow::Result<bool> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let store = ruby.get_inner(self.rb_store);
+        let supported: bool = store
+            .funcall("respond_to?", ("save_if",))
+            .map_err(|e| anyhow::anyhow!("Ruby store#respond_to? failed: {e}"))?;
+        if !supported {
+            return match self.load(&spend.id)? {
+                Some(existing) if existing.token.is_empty() || existing.token == spend.token => {
+                    self.save(spend)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            };
+        }
+        let json = serde_json::to_string(spend)?;
+        let written: bool = store
+            .funcall(
+                "save_if",
+                (spend.id.as_str(), json.as_str(), spend.token.as_str()),
+            )
+            .map_err(|e| anyhow::anyhow!("Ruby store#save_if failed: {e}"))?;
+        Ok(written)
     }
 }
 
@@ -515,7 +547,11 @@ impl RbClient {
         id: String,
         contract: &RbContract,
     ) -> Result<(bool, Vec<(String, u64, bool)>, bool), Error> {
-        let pending_offchain = self.store.load(&id).map_err(to_magnus_err)?.is_some();
+        let pending_offchain = self
+            .store
+            .load(&id)
+            .map_err(to_magnus_err)?
+            .is_some_and(|p| p.stage != SpendStage::Finalized);
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let (vtxos, any_recoverable) = self
             .rt

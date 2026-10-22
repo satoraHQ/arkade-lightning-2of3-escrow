@@ -8,9 +8,10 @@
 //!
 //! [`EscrowClient::spend_escrow_offchain`](crate::client::EscrowClient::spend_escrow_offchain)
 //! therefore records a [`PendingSpend`] *before* the first request leaves the
-//! process, upgrades it once the server's checkpoint signatures are in hand,
-//! and removes it only after `finalize` succeeds, and only if the record still
-//! belongs to the attempt that finalized ([`SpendStore::remove_if`]).
+//! process, upgrades it once the server's verified ark tx co-signature and
+//! checkpoint signatures are in hand, and marks it [`SpendStage::Finalized`]
+//! after `finalize` succeeds. Finalized records are kept, not removed: they
+//! are the parties' evidence of the server's commitment.
 //!
 //! [`SpendStore`] is the trait that backends implement. A file-based default
 //! ([`FileSpendStore`]) is provided.
@@ -34,6 +35,12 @@ pub enum SpendStage {
     /// `submit` succeeded and the fully-signed checkpoints are stored.
     /// Resuming re-sends `finalize`.
     Submitted,
+    /// `finalize` succeeded. The record is kept: it holds the server's
+    /// verified co-signature on the ark tx and the fully-signed checkpoints,
+    /// the parties' only evidence of the server's commitment. Resuming
+    /// returns the ark txid without contacting the server. Removal is up to
+    /// the application's retention policy ([`SpendStore::remove`]).
+    Finalized,
 }
 
 impl Default for SpendStage {
@@ -85,6 +92,11 @@ pub struct PendingSpend {
     /// [`SpendStage::Submitting`].
     #[serde(default)]
     pub party_signed_checkpoints: Vec<Vec<String>>,
+    /// The ark tx PSBT (base64) as co-signed by the server, verified. Present
+    /// from [`SpendStage::Submitted`] on. Kept so the parties hold the
+    /// server's commitment to the payout independently of `finalize`.
+    #[serde(default)]
+    pub server_signed_ark_tx: Option<String>,
 }
 
 impl PendingSpend {
@@ -112,10 +124,11 @@ pub trait SpendStore {
     /// Load a pending spend by its application-level ID.
     fn load(&self, id: &str) -> Result<Option<PendingSpend>>;
 
-    /// Remove a pending spend unconditionally.
+    /// Remove a spend record unconditionally.
     ///
-    /// The spend protocol does not call this; it uses [`remove_if`].
-    /// Operators may use it to clear a record by hand.
+    /// The spend protocol calls this only to clear a record the server
+    /// definitively rejected (via [`remove_if`]). Finalized records are left
+    /// for the application to prune under its own retention policy.
     ///
     /// [`remove_if`]: SpendStore::remove_if
     fn remove(&self, id: &str) -> Result<()>;
@@ -138,6 +151,25 @@ pub trait SpendStore {
         match self.load(id)? {
             Some(existing) if existing.token.is_empty() || existing.token == token => {
                 self.remove(id)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Overwrite the record for `spend.id` only if the stored record's token
+    /// equals `spend.token` (or is empty). Returns whether it was written.
+    ///
+    /// Used to mark a spend finalized without clobbering a record another
+    /// attempt wrote in the meantime. Same atomicity caveat and override
+    /// advice as [`remove_if`] (e.g. `UPDATE ... WHERE id = ? AND (token = ?
+    /// OR token IS NULL)`).
+    ///
+    /// [`remove_if`]: SpendStore::remove_if
+    fn save_if(&self, spend: &PendingSpend) -> Result<bool> {
+        match self.load(&spend.id)? {
+            Some(existing) if existing.token.is_empty() || existing.token == spend.token => {
+                self.save(spend)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -270,6 +302,7 @@ mod tests {
             ark_tx: Some("psbt".to_string()),
             unsigned_checkpoints: vec!["cp".to_string()],
             party_signed_checkpoints: vec![vec!["a".to_string()], vec!["b".to_string()]],
+            server_signed_ark_tx: None,
         }
     }
 
@@ -301,6 +334,32 @@ mod tests {
         // Removing an absent record is not an error.
         assert!(!store.remove_if("trade-1", "second").unwrap());
         store.remove("trade-1").unwrap();
+    }
+
+    #[test]
+    fn save_if_only_overwrites_a_record_with_the_same_token() {
+        let store = temp_store();
+        store.save(&record("trade-1", "first")).unwrap();
+
+        let mut finalized_by_second = record("trade-1", "second");
+        finalized_by_second.stage = SpendStage::Finalized;
+        assert!(!store.save_if(&finalized_by_second).unwrap());
+        assert_eq!(
+            store.load("trade-1").unwrap().unwrap().stage,
+            SpendStage::Submitting
+        );
+
+        let mut finalized_by_first = record("trade-1", "first");
+        finalized_by_first.stage = SpendStage::Finalized;
+        assert!(store.save_if(&finalized_by_first).unwrap());
+        assert_eq!(
+            store.load("trade-1").unwrap().unwrap().stage,
+            SpendStage::Finalized
+        );
+
+        // No record at all: nothing to guard, nothing written.
+        assert!(!store.save_if(&record("trade-2", "x")).unwrap());
+        assert!(store.load("trade-2").unwrap().is_none());
     }
 
     #[test]

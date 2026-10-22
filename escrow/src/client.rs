@@ -399,16 +399,20 @@ impl EscrowClient {
     ///
     /// # Arguments
     ///
-    /// - `store` — persistence backend for crash recovery. A record is written
-    ///   *before* `submit` is sent and removed only after `finalize` succeeds
-    ///   or the server definitively rejects the submit. Calling this method
-    ///   again with the same `id` (or [`resume_pending_spend`]) resumes from
-    ///   the recorded stage. Callers may also use the store as a local proxy
-    ///   for "pending offchain spend" status until Arkade exposes that status
-    ///   explicitly for escrow VTXOs.
+    /// - `store` — persistence backend for crash recovery and evidence. A
+    ///   record is written *before* `submit` is sent, upgraded with the
+    ///   server's verified ark tx co-signature after `submit`, marked
+    ///   finalized after `finalize`, and removed only if the server
+    ///   definitively rejects the submit. Calling this method again with the
+    ///   same `id` (or [`resume_pending_spend`]) resumes from the recorded
+    ///   stage; a finalized record returns its txid without a server call.
+    ///   Callers may also use the store as a local proxy for "pending
+    ///   offchain spend" status until Arkade exposes that status explicitly
+    ///   for escrow VTXOs.
     /// - `id` — application-level identifier for deduplication (e.g. trade ID).
-    ///   While a record exists for `id`, the persisted transaction is resumed
-    ///   and the other arguments are ignored.
+    ///   An `id` is bound to one ark transaction for good: while a record
+    ///   exists for it, the persisted transaction is resumed, and supplying a
+    ///   different `merged_ark_tx` under the same `id` is an error.
     ///
     /// # Recovery limits
     ///
@@ -449,6 +453,13 @@ impl EscrowClient {
     ) -> Result<Txid> {
         // Resume a previous attempt if one is recorded.
         if let Some(pending) = store.load(id).context("loading pending spend")? {
+            let supplied = merged_ark_tx.unsigned_tx.compute_txid().to_string();
+            anyhow::ensure!(
+                supplied == pending.ark_txid,
+                "spend id {id} is already bound to ark txid {}; refusing a different transaction \
+                 ({supplied}) under the same id",
+                pending.ark_txid
+            );
             return self.resume_recorded(store, pending).await;
         }
 
@@ -487,6 +498,7 @@ impl EscrowClient {
                 .iter()
                 .map(|cps| cps.iter().map(psbt_to_base64).collect())
                 .collect(),
+            server_signed_ark_tx: None,
         };
 
         // Persist before the request leaves the process. If this fails,
@@ -510,7 +522,8 @@ impl EscrowClient {
     ///
     /// Returns `Ok(None)` if no record exists. Otherwise behaves exactly like
     /// [`spend_escrow_offchain`] does when it finds a record: re-sends the
-    /// recorded `submit` or `finalize`, clears the record on success.
+    /// recorded `submit` or `finalize`, marks the record finalized on
+    /// success, or returns the txid at once if it already is.
     ///
     /// [`spend_escrow_offchain`]: EscrowClient::spend_escrow_offchain
     pub async fn resume_pending_spend(
@@ -536,8 +549,33 @@ impl EscrowClient {
             .context("invalid ark_txid in pending spend")?;
 
         match pending.stage {
+            SpendStage::Finalized => {
+                tracing::info!(%ark_txid, "Spend already finalized");
+                Ok(ark_txid)
+            }
             SpendStage::Submitted => {
-                tracing::info!(%ark_txid, "Resuming finalization of pending spend");
+                // Fail closed: finalizing releases the parties' checkpoint
+                // signatures, so the stored evidence of the server's
+                // commitment is checked again here. A record without it
+                // predates the check (or was tampered with).
+                let evidence = pending
+                    .server_signed_ark_tx
+                    .as_deref()
+                    .with_context(|| {
+                        format!(
+                            "pending spend {} (ark txid {ark_txid}) at submitted stage has no \
+                             verified server co-signature on record; refusing to finalize",
+                            pending.id
+                        )
+                    })
+                    .and_then(psbt_from_base64)
+                    .context("decoding persisted co-signed ark tx")?;
+                anyhow::ensure!(
+                    evidence.unsigned_tx.compute_txid() == ark_txid,
+                    "persisted co-signed ark tx does not match recorded ark txid {ark_txid}"
+                );
+                spend::verify_server_ark_tx_sig(&evidence, &evidence)
+                    .context("re-verifying persisted server co-signature before finalize")?;
 
                 let final_checkpoints: Vec<Psbt> = pending
                     .signed_checkpoints
@@ -545,8 +583,24 @@ impl EscrowClient {
                     .map(|b64| psbt_from_base64(b64))
                     .collect::<Result<_>>()
                     .context("decoding persisted checkpoint PSBTs")?;
+                // The ark tx spends the checkpoint outputs: every stored
+                // checkpoint must be one of its inputs, or the signatures
+                // about to be released belong to some other transaction.
+                anyhow::ensure!(
+                    !final_checkpoints.is_empty()
+                        && final_checkpoints.iter().all(|cp| {
+                            let cp_txid = cp.unsigned_tx.compute_txid();
+                            evidence
+                                .unsigned_tx
+                                .input
+                                .iter()
+                                .any(|i| i.previous_output.txid == cp_txid)
+                        }),
+                    "persisted checkpoints are not inputs of the recorded ark tx {ark_txid}"
+                );
+                tracing::info!(%ark_txid, "Resuming finalization of pending spend");
 
-                self.finalize_and_clear(store, &pending, ark_txid, final_checkpoints)
+                self.finalize_and_record(store, &pending, ark_txid, final_checkpoints)
                     .await
             }
             SpendStage::Submitting => {
@@ -588,7 +642,7 @@ impl EscrowClient {
         }
     }
 
-    /// Submit, record the server's signatures, finalize, clear the record.
+    /// Submit, record the server's signatures, finalize, mark the record.
     /// `pending` must already be persisted at [`SpendStage::Submitting`].
     ///
     /// `first_attempt` is true when this process wrote the record just now,
@@ -605,7 +659,7 @@ impl EscrowClient {
         party_signed_checkpoints: &[&[Psbt]],
         first_attempt: bool,
     ) -> Result<Txid> {
-        let (ark_txid, server_checkpoints) = match self
+        let (ark_txid, server_signed_ark_tx, server_checkpoints) = match self
             .submit_internal(merged_ark_tx, unsigned_checkpoints)
             .await
         {
@@ -647,6 +701,7 @@ impl EscrowClient {
         // Upgrade the record: from here on a retry only needs to finalize.
         pending.stage = SpendStage::Submitted;
         pending.signed_checkpoints = final_checkpoints.iter().map(psbt_to_base64).collect();
+        pending.server_signed_ark_tx = Some(psbt_to_base64(&server_signed_ark_tx));
         pending.ark_tx = None;
         pending.unsigned_checkpoints.clear();
         pending.party_signed_checkpoints.clear();
@@ -669,7 +724,7 @@ impl EscrowClient {
         tracing::info!(%ark_txid, "Submitted offchain TX, attempting finalization");
 
         let result = self
-            .finalize_and_clear(store, &pending, ark_txid, final_checkpoints)
+            .finalize_and_record(store, &pending, ark_txid, final_checkpoints)
             .await;
         if result.is_err() && !saved {
             // Last chance to keep the server's signatures: without this the
@@ -719,7 +774,10 @@ impl EscrowClient {
         Self::is_definitive_rejection(err)
     }
 
-    async fn finalize_and_clear(
+    /// Finalize, then mark the record finalized. The record is kept: it
+    /// holds the server's verified co-signature and the fully-signed
+    /// checkpoints.
+    async fn finalize_and_record(
         &self,
         store: &(impl SpendStore + ?Sized),
         pending: &PendingSpend,
@@ -728,10 +786,14 @@ impl EscrowClient {
     ) -> Result<Txid> {
         self.finalize_internal(ark_txid, final_checkpoints).await?;
 
-        let removed = store
-            .remove_if(&pending.id, &pending.token)
-            .context("removing finalized spend")?;
-        if !removed {
+        // Only this attempt's record is upgraded; a record another attempt
+        // wrote since is left alone.
+        let mut finalized = pending.clone();
+        finalized.stage = SpendStage::Finalized;
+        let written = store
+            .save_if(&finalized)
+            .context("recording finalized spend")?;
+        if !written {
             tracing::warn!(
                 %ark_txid,
                 id = %pending.id,
@@ -885,23 +947,34 @@ impl EscrowClient {
 
     /// Submit a signed ark_tx + unsigned checkpoint PSBTs to the Arkade server.
     ///
-    /// Returns the ark txid and server-signed checkpoint PSBTs (with
-    /// witness_scripts restored).
+    /// Returns the ark txid, the canonical co-signed ark tx (the submitted
+    /// PSBT plus the server's verified signature) and the server-signed
+    /// checkpoint PSBTs (with witness_scripts restored).
+    ///
+    /// The co-signature check is what keeps the protocol invariant: the
+    /// parties' checkpoint signatures must not reach the server (in
+    /// `finalize`) unless the server has committed to the ark tx that pays
+    /// them out. A server that returns checkpoints without a valid
+    /// co-signature gets nothing further; the pending record stays at
+    /// `submitting` for follow-up.
     async fn submit_internal(
         &self,
         ark_tx: Psbt,
         checkpoint_txs: Vec<Psbt>,
-    ) -> Result<(Txid, Vec<Psbt>)> {
+    ) -> Result<(Txid, Psbt, Vec<Psbt>)> {
         let ark_txid = ark_tx.unsigned_tx.compute_txid();
-
         let res = Self::run_with_timeout(
             self.timeout,
             "submitting offchain transaction",
             self.grpc
-                .submit_offchain_transaction_request(ark_tx, checkpoint_txs.clone()),
+                .submit_offchain_transaction_request(ark_tx.clone(), checkpoint_txs.clone()),
         )
         .await
         .context("submitting offchain transaction")?;
+
+        let cosigned_ark_tx = spend::verify_server_ark_tx_sig(&ark_tx, &res.signed_ark_tx)
+            .context("verifying server co-signature on ark transaction")?;
+        tracing::debug!(%ark_txid, "Server co-signed ark transaction");
 
         // Build a map from original checkpoint txid → witness_script so we can
         // restore witness_script on the server-returned checkpoints (the server
@@ -927,7 +1000,7 @@ impl EscrowClient {
             })
             .collect();
 
-        Ok((ark_txid, signed_checkpoints))
+        Ok((ark_txid, cosigned_ark_tx, signed_checkpoints))
     }
 
     /// Finalize the offchain transaction with fully-signed checkpoint PSBTs.
