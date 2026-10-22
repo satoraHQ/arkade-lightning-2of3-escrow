@@ -43,6 +43,9 @@ async fn release_pays_the_buyer_destination() -> Result<()> {
         )
         .await?;
     assert_eq!(txid, signed.merged_ark_tx.unsigned_tx.compute_txid());
+    let record = store.load("release")?.context("finalized record kept")?;
+    assert_eq!(record.stage, SpendStage::Finalized);
+    assert!(record.server_signed_ark_tx.is_some());
 
     wait_for_exact_contract_amount(&client, &destination, ESCROW_AMOUNT)
         .await
@@ -146,6 +149,7 @@ async fn lost_submit_response_keeps_the_record_and_the_input_stays_locked() -> R
             .iter()
             .map(|cps| cps.iter().map(psbt_to_base64).collect())
             .collect(),
+        server_signed_ark_tx: None,
     })?;
 
     // The retry resumes the record and re-sends the same submit.
@@ -241,6 +245,12 @@ async fn resume_after_crash_between_submit_and_finalize() -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
+    // The record carries the server's verified co-signature, as the client
+    // writes it; a real arkd signature passes the leaf-key check.
+    let cosigned_ark_tx =
+        spend::verify_server_ark_tx_sig(&signed.merged_ark_tx, &res.signed_ark_tx)
+            .context("arkd co-signature did not verify")?;
+
     let store = temp_spend_store()?;
     store.save(&PendingSpend {
         id: "crashed".to_string(),
@@ -251,10 +261,15 @@ async fn resume_after_crash_between_submit_and_finalize() -> Result<()> {
         ark_tx: None,
         unsigned_checkpoints: vec![],
         party_signed_checkpoints: vec![],
+        server_signed_ark_tx: Some(psbt_to_base64(&cosigned_ark_tx)),
     })?;
 
     let resumed = client.resume_pending_spend(&store, "crashed").await?;
     assert_eq!(resumed, Some(ark_txid));
+    assert_eq!(
+        store.load("crashed")?.context("record kept")?.stage,
+        SpendStage::Finalized
+    );
 
     wait_for_exact_contract_amount(&client, &destination, ESCROW_AMOUNT)
         .await
