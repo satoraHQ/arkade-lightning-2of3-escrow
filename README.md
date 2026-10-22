@@ -236,3 +236,19 @@ A custom store must:
 
 Do not run two spends for the same `id` concurrently. The store is not a lock;
 the token only keeps a finished attempt from deleting another attempt's record.
+
+## End-to-end tests
+
+`escrow/tests/signer_rotation.rs` runs against a real arkd. The stack comes from
+the public [arkade-regtest](https://github.com/ArkLabsHQ/arkade-regtest)
+submodule and the public arkd container image pinned in `.env.regtest`; no
+secrets or private repositories are involved, so forks can run it unchanged.
+
+```bash
+git submodule update --init   # once
+just regtest-up               # Bitcoin Core + Fulcrum + arkd, ~1 min
+just e2e
+just regtest-down
+```
+
+Requires Docker and Node 20+. CI runs the same recipe in the `e2e` job.

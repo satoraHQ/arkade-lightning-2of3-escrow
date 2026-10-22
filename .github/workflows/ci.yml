@@ -27,3 +27,53 @@ jobs:
       - uses: extractions/setup-just@v2
       - uses: Swatinem/rust-cache@v2
       - run: just ci
+
+  # End-to-end tests against a real arkd. The regtest stack (Bitcoin Core +
+  # Fulcrum + arkd) comes from the public `regtest` submodule (arkade-regtest)
+  # and its zero-dependency Node CLI; arkd runs from the public container image
+  # pinned in .env.regtest. No secrets, forks can run this as-is.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: e2e
+
+      # Build the test binary while the stack is not yet consuming CPU.
+      - name: Build e2e tests
+        run: cargo test -p ark-escrow --test signer_rotation --no-run
+
+      - name: Start regtest stack
+        run: node regtest/regtest.mjs start --env .env.regtest --profile ark
+
+      - name: Run e2e tests
+        env:
+          REGTEST_DIR: ${{ github.workspace }}/regtest
+        run: just e2e
+
+      - name: Print container logs on failure
+        if: failure()
+        run: |
+          echo "=== block height ==="
+          node regtest/regtest.mjs rpc getblockcount 2>&1 || echo "(getblockcount failed)"
+          for c in bitcoin bitcoin-miner fulcrum arkd arkd-wallet; do
+            echo "=== docker logs $c ==="
+            docker logs "$c" 2>&1 | tail -200 || echo "(container $c not found)"
+          done
+
+      - name: Cleanup regtest stack
+        if: always()
+        run: node regtest/regtest.mjs clean || true
