@@ -130,19 +130,55 @@ async fn a_failed_withdrawal_does_not_mask_the_ceremony_error() {
 }
 
 #[tokio::test]
-async fn withdrawal_is_bounded_even_when_the_request_timeout_is_disabled() {
-    let server = RefreshServer::start(Behavior::StallStream).await;
+async fn a_stalled_withdrawal_is_bounded_by_the_request_timeout() {
+    let server = RefreshServer::start(Behavior::StallStreamDeleteStalls).await;
     let mut client = connect(&server).await;
-    client.set_timeout(None);
+    client.set_timeout(Some(Duration::from_millis(300)));
     client.set_refresh_timeout(Some(Duration::from_millis(200)));
     let (refresh, cosigner) = refresh_intent(true);
+
+    let started = std::time::Instant::now();
     let error = tokio::time::timeout(
         Duration::from_secs(5),
         client.refresh_escrow(refresh, cosigner),
     )
     .await
-    .expect("cleanup must not hang")
+    .expect("stalled cleanup must not hang")
     .unwrap_err();
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
     assert_eq!(server.delete_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_delete_proof_over_other_inputs_is_refused_before_anything_is_sent() {
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, TxIn, Witness, hashes::Hash};
+    let server = RefreshServer::start(Behavior::StaleIntentOnce).await;
+    let client = connect(&server).await;
+    let (mut refresh, cosigner) = refresh_intent(true);
+
+    // Register proof: [commitment, A]. Delete proof: [commitment, B].
+    let txin = |seed: u8| TxIn {
+        previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([seed; 32]), 0),
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ZERO,
+        witness: Witness::new(),
+    };
+    refresh.intent.proof.unsigned_tx.input = vec![txin(0), txin(1)];
+    refresh.intent.proof.inputs = vec![Default::default(), Default::default()];
+    let delete = refresh.delete_intent.as_mut().unwrap();
+    delete.proof.unsigned_tx.input = vec![txin(0), txin(2)];
+    delete.proof.inputs = vec![Default::default(), Default::default()];
+
+    let error = client.refresh_escrow(refresh, cosigner).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("does not cover the same inputs"),
+        "{error:#}"
+    );
+    assert_eq!(server.register_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.delete_requests.load(Ordering::SeqCst), 0);
 }

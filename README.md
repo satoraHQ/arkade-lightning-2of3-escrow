@@ -177,8 +177,9 @@ it. Changing `timeout_ms` does not change the refresh deadline.
 A timeout stops the local wait and does not prove that the batch failed. With a
 signed delete proof (fifth and sixth values from `prepare_refresh`, signed
 alongside the intent by the same parties) the client clears a stale intent left
-by an earlier attempt before registering ("already registered", retried for up
-to 30 s while the stale intent may be inside a running batch), and makes one
+by an earlier attempt before registering ("already registered"; if arkd reports
+nothing queued the delete is retried up to six times, 5 s apart, since the stale
+intent may be inside a running batch), and makes one
 attempt to withdraw its own intent after a failed or timed-out ceremony. That
 withdrawal is best effort and takes up to one ordinary request timeout on top of
 the refresh deadline; an intent inside a running batch is not queued at that
@@ -191,6 +192,8 @@ The delete proof is valid for 24 hours from `prepare_refresh`. Whoever holds the
 signed proof can cancel any queued intent over those inputs during that time, as
 often as they like. It cannot move funds. Treat it like the other signed
 refresh material: keep it with the trade, do not hand it to third parties.
+Refresh material older than that has an expired delete proof; prepare and
+co-sign a fresh refresh rather than retrying it.
 
 ```ruby
 # Check VTXO status

@@ -69,6 +69,8 @@ pub enum Behavior {
     StaleIntentNoMatchOnce,
     /// The event stream stalls and every `DeleteIntent` fails.
     StallStreamDeleteFails,
+    /// The event stream stalls and `DeleteIntent` never answers.
+    StallStreamDeleteStalls,
 }
 
 /// Seed of the fake server's active signer key (`signer_pubkey` in `GetInfo`).
@@ -247,6 +249,9 @@ impl RefreshServer {
                                 }
                                 "/ark.v1.ArkService/DeleteIntent" => {
                                     let n = delete_counter.fetch_add(1, Ordering::SeqCst);
+                                    if matches!(behavior, Behavior::StallStreamDeleteStalls) {
+                                        std::future::pending::<()>().await;
+                                    }
                                     let failure = match behavior {
                                         Behavior::StaleIntentNoMatchOnce if n == 0 => Some((
                                             "3",
@@ -305,7 +310,9 @@ impl RefreshServer {
                                     stream_observed.store(true, Ordering::SeqCst);
                                     if matches!(
                                         behavior,
-                                        Behavior::StallStream | Behavior::StallStreamDeleteFails
+                                        Behavior::StallStream
+                                            | Behavior::StallStreamDeleteFails
+                                            | Behavior::StallStreamDeleteStalls
                                     ) {
                                         let headers = http::Response::builder()
                                             .header("content-type", "application/grpc")

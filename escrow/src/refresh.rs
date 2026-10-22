@@ -22,6 +22,10 @@ use crate::contract::{EscrowContract, SignerSet};
 /// valid. Long enough to cover retries of a refresh, short enough that the
 /// authority it grants (cancelling queued intents over these inputs) does
 /// not outlive the trade.
+///
+/// Refresh material persisted for longer than this has an expired delete
+/// proof: cleanup then fails and the caller must prepare and co-sign a
+/// fresh refresh. A signed proof cannot be renewed by changing its message.
 pub const DELETE_PROOF_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often, and how long, to retry deleting a stale intent that arkd
@@ -106,6 +110,29 @@ fn prepare_delete_intent(intent_inputs: Vec<intent::Input>) -> Result<intent::In
     )
     .map_err(|e| anyhow::anyhow!("{e:#}"))
     .context("preparing delete intent")
+}
+
+/// The delete proof must cover exactly the inputs the register proof
+/// covers, or it cannot clear the intent it is meant to clear. Input 0 of
+/// each proof is the message commitment and is skipped.
+pub(crate) fn ensure_same_inputs(register: &intent::Intent, delete: &intent::Intent) -> Result<()> {
+    let outpoints = |i: &intent::Intent| -> Vec<OutPoint> {
+        let mut v: Vec<OutPoint> = i
+            .proof
+            .unsigned_tx
+            .input
+            .iter()
+            .skip(1)
+            .map(|txin| txin.previous_output)
+            .collect();
+        v.sort();
+        v
+    };
+    anyhow::ensure!(
+        outpoints(register) == outpoints(delete),
+        "delete intent does not cover the same inputs as the refresh intent"
+    );
+    Ok(())
 }
 
 /// Whether a registration error means an earlier intent still holds one of
@@ -278,6 +305,9 @@ pub async fn execute_refresh<R: Rng + CryptoRng>(
     refresh: RefreshIntent,
     refresh_cosigner_kp: Keypair,
 ) -> Result<Txid> {
+    if let Some(delete) = &refresh.delete_intent {
+        ensure_same_inputs(&refresh.intent, delete)?;
+    }
     let delete = refresh.delete_intent.clone();
     let retry = refresh.clone();
     #[allow(deprecated)]

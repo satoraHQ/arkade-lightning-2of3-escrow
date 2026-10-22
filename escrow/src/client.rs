@@ -361,6 +361,11 @@ impl EscrowClient {
     ) -> Result<Txid> {
         let info = self.server_info()?;
         let mut rng = OsRng;
+        if let Some(delete) = &refresh.delete_intent {
+            // Refuse a miswired delete proof before anything is sent, so the
+            // cleanup below never fires it at the wrong inputs either.
+            crate::refresh::ensure_same_inputs(&refresh.intent, delete)?;
+        }
         let delete = refresh.delete_intent.clone();
 
         let result = Self::run_with_timeout(
