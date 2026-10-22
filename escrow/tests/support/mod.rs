@@ -27,6 +27,10 @@ pub struct RefreshServer {
     /// Total `tap_script_sigs` seen on checkpoints in `SubmitTx` requests.
     /// Must stay 0: party checkpoint signatures never travel in submit.
     pub submitted_checkpoint_sigs: Arc<AtomicUsize>,
+    /// Number of `RegisterIntent` requests received.
+    pub register_requests: Arc<AtomicUsize>,
+    /// Number of `DeleteIntent` requests received.
+    pub delete_requests: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
@@ -57,6 +61,9 @@ pub enum Behavior {
     /// `SubmitTx` co-signs the ark tx with the key derived from this seed
     /// instead of the active signer key; `FinalizeTx` succeeds.
     AcceptCosignedBy(u8),
+    /// The first `RegisterIntent` answers "already registered"; later ones
+    /// succeed. The event stream then ends the ceremony with an error.
+    StaleIntentOnce,
 }
 
 /// Seed of the fake server's active signer key (`signer_pubkey` in `GetInfo`).
@@ -154,6 +161,10 @@ impl RefreshServer {
         let finalize_counter = finalize_requests.clone();
         let submitted_checkpoint_sigs = Arc::new(AtomicUsize::new(0));
         let cp_sig_counter = submitted_checkpoint_sigs.clone();
+        let register_requests = Arc::new(AtomicUsize::new(0));
+        let register_counter = register_requests.clone();
+        let delete_requests = Arc::new(AtomicUsize::new(0));
+        let delete_counter = delete_requests.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -163,6 +174,8 @@ impl RefreshServer {
                 let submit_counter = submit_counter.clone();
                 let finalize_counter = finalize_counter.clone();
                 let cp_sig_counter = cp_sig_counter.clone();
+                let register_counter = register_counter.clone();
+                let delete_counter = delete_counter.clone();
                 connections.spawn(async move {
                     let mut connection = h2::server::handshake(socket).await.unwrap();
                     let mut requests = JoinSet::new();
@@ -173,6 +186,8 @@ impl RefreshServer {
                         let submit_counter = submit_counter.clone();
                         let finalize_counter = finalize_counter.clone();
                         let cp_sig_counter = cp_sig_counter.clone();
+                        let register_counter = register_counter.clone();
+                        let delete_counter = delete_counter.clone();
                         requests.spawn(async move {
                             let (parts, mut body) = request.into_parts();
                             let payload = match parts.uri.path() {
@@ -225,7 +240,12 @@ impl RefreshServer {
                                     }
                                     info
                                 }
+                                "/ark.v1.ArkService/DeleteIntent" => {
+                                    delete_counter.fetch_add(1, Ordering::SeqCst);
+                                    Vec::new()
+                                }
                                 "/ark.v1.ArkService/RegisterIntent" => {
+                                    let n = register_counter.fetch_add(1, Ordering::SeqCst);
                                     match behavior {
                                         Behavior::DelayRegistration(delay) => {
                                             tokio::time::sleep(delay).await;
@@ -233,14 +253,20 @@ impl RefreshServer {
                                         Behavior::StallRegistration => {
                                             std::future::pending::<()>().await;
                                         }
-                                        Behavior::StallStream
-                                        | Behavior::StallInfo
-                                        | Behavior::StallSubmit
-                                        | Behavior::StallFinalize
-                                        | Behavior::AcceptSpend
-                                        | Behavior::RejectSubmit
-                                        | Behavior::AcceptWithoutCosigning
-                                        | Behavior::AcceptCosignedBy(_) => {}
+                                        Behavior::StaleIntentOnce if n == 0 => {
+                                            let headers = http::Response::builder()
+                                                .header("content-type", "application/grpc")
+                                                .header("grpc-status", "3")
+                                                .header(
+                                                    "grpc-message",
+                                                    "VTXO_ALREADY_REGISTERED (5): abcd:0 already registered",
+                                                )
+                                                .body(())
+                                                .unwrap();
+                                            let _ = response.send_response(headers, true);
+                                            return;
+                                        }
+                                        _ => {}
                                     }
                                     RegisterIntentResponse {
                                         intent_id: "test-intent".to_owned(),
@@ -298,6 +324,8 @@ impl RefreshServer {
             submit_requests,
             finalize_requests,
             submitted_checkpoint_sigs,
+            register_requests,
+            delete_requests,
             task,
         }
     }

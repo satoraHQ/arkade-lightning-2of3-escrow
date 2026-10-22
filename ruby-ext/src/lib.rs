@@ -612,13 +612,23 @@ impl RbClient {
     /// Prepare unsigned refresh PSBTs.
     ///
     /// Returns `[intent_proof_b64, intent_message_json, forfeit_psbts_b64[], cosigner_pk_hex]`.
+    /// Prepare unsigned refresh PSBTs.
+    ///
+    /// Returns `[intent_proof_b64, intent_message_json, forfeit_b64s,
+    /// cosigner_pk_hex, delete_proof_b64]`. The fifth element is the unsigned
+    /// `delete` intent proof over the same inputs; sign it with the same keys
+    /// (`ArkEscrow.sign_refresh(..., delete_proof_b64)`) and pass it to
+    /// `refresh_escrow` so a stale intent from an earlier attempt is cleared
+    /// automatically and a failed ceremony withdraws its own intent. Callers
+    /// destructuring four values keep working and simply get no cleanup.
+    #[allow(clippy::type_complexity)]
     fn prepare_refresh(
         &self,
         contract: &RbContract,
         vtxos_data: Vec<(String, u64, bool)>,
         signer_set: String,
         cosigner_sk_hex: String,
-    ) -> Result<(String, String, Vec<String>, String), Error> {
+    ) -> Result<(String, String, Vec<String>, String, Option<String>), Error> {
         let vtxos: Vec<RefreshVtxo> = vtxos_data
             .into_iter()
             .map(|(outpoint_str, amount_sats, is_swept)| {
@@ -648,11 +658,17 @@ impl RbClient {
         let cosigner_pk_hex =
             bitcoin::hex::DisplayHex::to_lower_hex_string(&refresh.refresh_cosigner_pk.serialize());
 
+        let delete_proof_b64 = refresh
+            .delete_intent
+            .as_ref()
+            .map(|intent| psbt_to_base64(&intent.proof));
+
         Ok((
             intent_proof_b64,
             intent_message_json,
             forfeit_psbts_b64,
             cosigner_pk_hex,
+            delete_proof_b64,
         ))
     }
 
@@ -660,13 +676,24 @@ impl RbClient {
     ///
     /// Takes the fully-signed refresh PSBTs and returns the commitment
     /// transaction ID (hex string).
-    fn refresh_escrow(
-        &self,
-        intent_proof_b64: String,
-        intent_message_json: String,
-        forfeit_psbts_b64: Vec<String>,
-        cosigner_sk_hex: String,
-    ) -> Result<String, Error> {
+    /// `refresh_escrow(intent_proof_b64, intent_message_json, forfeit_b64s,
+    /// cosigner_sk_hex, delete_proof_b64 = nil)`.
+    fn refresh_escrow(&self, args: &[Value]) -> Result<String, Error> {
+        let args =
+            scan_args::<(String, String, Vec<String>, String), (Option<String>,), (), (), (), ()>(
+                args,
+            )?;
+        let (intent_proof_b64, intent_message_json, forfeit_psbts_b64, cosigner_sk_hex) =
+            args.required;
+        let (delete_proof_b64,) = args.optional;
+        let delete_intent = delete_proof_b64
+            .map(|b64| -> Result<_, Error> {
+                Ok(ark_core::intent::Intent::new(
+                    psbt_from_base64(&b64)?,
+                    ark_core::intent::IntentMessage::Delete { expire_at: 0 },
+                ))
+            })
+            .transpose()?;
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
 
         let intent_proof = psbt_from_base64(&intent_proof_b64)?;
@@ -683,6 +710,7 @@ impl RbClient {
             intent: ark_core::intent::Intent::new(intent_proof, intent_message),
             forfeit_psbts,
             refresh_cosigner_pk: cosigner_kp.public_key(),
+            delete_intent,
         };
 
         let txid = self
@@ -691,6 +719,21 @@ impl RbClient {
             .map_err(to_magnus_err)?;
 
         Ok(txid.to_string())
+    }
+
+    /// Delete queued intents spending the inputs of a signed `delete` proof
+    /// (from `prepare_refresh`, signed via `sign_refresh`). Succeeds when
+    /// nothing is queued. For operator use after a refresh that could not
+    /// clean up after itself.
+    fn delete_refresh_intent(&self, delete_proof_b64: String) -> Result<(), Error> {
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+        let intent = ark_core::intent::Intent::new(
+            psbt_from_base64(&delete_proof_b64)?,
+            ark_core::intent::IntentMessage::Delete { expire_at: 0 },
+        );
+        self.rt
+            .block_on(client.delete_refresh_intent(intent))
+            .map_err(to_magnus_err)
     }
 
     /// Execute delegate settlement. Blocks until the batch ceremony completes.
@@ -961,12 +1004,29 @@ fn rb_sign_checkpoint(psbt_b64: String, secret_key_hex: String) -> Result<String
 
 /// Sign refresh PSBTs (intent + forfeits) with a single keypair.
 /// Takes and returns: (intent_proof_b64, forfeit_psbts_b64[])
-fn rb_sign_refresh(
-    intent_proof_b64: String,
-    forfeit_psbts_b64: Vec<String>,
-    secret_key_hex: String,
-) -> Result<(String, Vec<String>), Error> {
-    sign_intent_and_forfeits(intent_proof_b64, forfeit_psbts_b64, secret_key_hex)
+/// `sign_refresh(intent_proof_b64, forfeit_b64s, secret_key_hex,
+/// delete_proof_b64 = nil)`.
+///
+/// Returns `[signed_intent_b64, signed_forfeit_b64s]`, plus
+/// `signed_delete_proof_b64` as a third element when a delete proof was
+/// given.
+fn rb_sign_refresh(args: &[Value]) -> Result<Value, Error> {
+    let ruby = Ruby::get().expect("called from Ruby thread");
+    let args = scan_args::<(String, Vec<String>, String), (Option<String>,), (), (), (), ()>(args)?;
+    let (intent_proof_b64, forfeit_psbts_b64, secret_key_hex) = args.required;
+    let (delete_proof_b64,) = args.optional;
+    let (intent_b64, forfeits_b64) =
+        sign_intent_and_forfeits(intent_proof_b64, forfeit_psbts_b64, secret_key_hex.clone())?;
+    match delete_proof_b64 {
+        None => Ok(ruby.into_value((intent_b64, forfeits_b64))),
+        Some(delete_b64) => {
+            let mut proof = psbt_from_base64(&delete_b64)?;
+            let kp = parse_secret_key(&secret_key_hex)?;
+            ark_escrow::refresh::sign_delete_intent_proof(&mut proof, &kp)
+                .map_err(to_magnus_err)?;
+            Ok(ruby.into_value((intent_b64, forfeits_b64, psbt_to_base64(&proof))))
+        }
+    }
 }
 
 /// Sign delegate PSBTs (intent + forfeits) with a single keypair.
@@ -1110,13 +1170,17 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         method!(RbClient::resume_pending_spend, 1),
     )?;
     client_class.define_method("prepare_refresh", method!(RbClient::prepare_refresh, 4))?;
-    client_class.define_method("refresh_escrow", method!(RbClient::refresh_escrow, 4))?;
+    client_class.define_method("refresh_escrow", method!(RbClient::refresh_escrow, -1))?;
+    client_class.define_method(
+        "delete_refresh_intent",
+        method!(RbClient::delete_refresh_intent, 1),
+    )?;
     client_class.define_method("settle_delegate", method!(RbClient::settle_delegate, 4))?;
 
     module.define_module_function("sign_ark_tx", function!(rb_sign_ark_tx, 2))?;
     module.define_module_function("sign_checkpoint", function!(rb_sign_checkpoint, 2))?;
     module.define_module_function("merge_sigs", function!(rb_merge_sigs, 2))?;
-    module.define_module_function("sign_refresh", function!(rb_sign_refresh, 3))?;
+    module.define_module_function("sign_refresh", function!(rb_sign_refresh, -1))?;
     module.define_module_function("sign_delegate", function!(rb_sign_delegate, 3))?;
 
     Ok(())

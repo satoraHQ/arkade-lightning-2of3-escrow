@@ -361,8 +361,9 @@ impl EscrowClient {
     ) -> Result<Txid> {
         let info = self.server_info()?;
         let mut rng = OsRng;
+        let delete = refresh.delete_intent.clone();
 
-        Self::run_with_timeout(
+        let result = Self::run_with_timeout(
             self.refresh_timeout,
             "refreshing escrow",
             crate::refresh::execute_refresh(
@@ -372,6 +373,36 @@ impl EscrowClient {
                 refresh,
                 refresh_cosigner_kp,
             ),
+        )
+        .await;
+
+        // A failed or timed-out ceremony may leave this attempt's intent
+        // queued on the server, holding the inputs. Withdraw it so the next
+        // attempt does not start with "already registered".
+        if let (Err(_), Some(delete)) = (&result, delete) {
+            match self.delete_refresh_intent(delete).await {
+                Ok(()) => tracing::info!("Withdrew refresh intent after failed ceremony"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Could not withdraw refresh intent after failed ceremony; \
+                     the next attempt will delete it before registering"
+                ),
+            }
+        }
+        result
+    }
+
+    /// Delete queued intents that spend the inputs of a `delete` intent
+    /// (see [`RefreshIntent::delete_intent`]). Succeeds when nothing was
+    /// queued. Bounded by the ordinary request timeout.
+    pub async fn delete_refresh_intent(
+        &self,
+        delete_intent: ark_core::intent::Intent,
+    ) -> Result<()> {
+        Self::run_with_timeout(
+            self.timeout,
+            "deleting refresh intent",
+            crate::refresh::delete_intent(&self.grpc, delete_intent),
         )
         .await
     }
