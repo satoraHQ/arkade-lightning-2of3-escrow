@@ -41,6 +41,7 @@ async fn refresh(client: &EscrowClient) -> anyhow::Result<Txid> {
         ),
         forfeit_psbts: vec![],
         refresh_cosigner_pk: cosigner.public_key(),
+        delete_intent: None,
     };
     // Bound regressions that accidentally remove the refresh deadline entirely.
     tokio::time::timeout(

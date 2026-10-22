@@ -361,8 +361,14 @@ impl EscrowClient {
     ) -> Result<Txid> {
         let info = self.server_info()?;
         let mut rng = OsRng;
+        if let Some(delete) = &refresh.delete_intent {
+            // Refuse a miswired delete proof before anything is sent, so the
+            // cleanup below never fires it at the wrong inputs either.
+            crate::refresh::ensure_same_inputs(&refresh.intent, delete)?;
+        }
+        let delete = refresh.delete_intent.clone();
 
-        Self::run_with_timeout(
+        let result = Self::run_with_timeout(
             self.refresh_timeout,
             "refreshing escrow",
             crate::refresh::execute_refresh(
@@ -372,6 +378,44 @@ impl EscrowClient {
                 refresh,
                 refresh_cosigner_kp,
             ),
+        )
+        .await;
+
+        // A failed or timed-out ceremony may leave this attempt's intent
+        // queued on the server, holding the inputs. Withdraw it so the next
+        // attempt does not start with "already registered". Best effort and
+        // single-shot: an intent inside a running batch is not queued now
+        // and comes back if that batch fails; the next attempt handles that.
+        if let (Err(_), Some(delete)) = (&result, delete) {
+            match self.delete_refresh_intent(delete).await {
+                Ok(true) => tracing::info!("Withdrew refresh intent after failed ceremony"),
+                Ok(false) => tracing::info!(
+                    "No queued refresh intent to withdraw after failed ceremony \
+                     (it may be inside a running batch)"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Could not withdraw refresh intent after failed ceremony; \
+                     the next attempt will delete it before registering"
+                ),
+            }
+        }
+        result
+    }
+
+    /// Delete queued intents that spend the inputs of a `delete` intent
+    /// (see [`RefreshIntent::delete_intent`]). Returns whether anything was
+    /// deleted; `Ok(false)` means nothing was queued at that moment. One
+    /// attempt, bounded by the ordinary request timeout (or
+    /// [`DEFAULT_TIMEOUT`] if that is disabled).
+    pub async fn delete_refresh_intent(
+        &self,
+        delete_intent: ark_core::intent::Intent,
+    ) -> Result<bool> {
+        Self::run_with_timeout(
+            Some(self.timeout.unwrap_or(DEFAULT_TIMEOUT)),
+            "deleting refresh intent",
+            crate::refresh::delete_intent(&self.grpc, delete_intent, 1),
         )
         .await
     }

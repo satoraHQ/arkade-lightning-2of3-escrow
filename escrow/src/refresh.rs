@@ -14,8 +14,25 @@ use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1, schnorr};
 use bitcoin::{Amount, OutPoint, Psbt, Txid, XOnlyPublicKey};
 use rand::{CryptoRng, Rng};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::contract::{EscrowContract, SignerSet};
+
+/// How long the `delete` intent proof built by [`prepare_refresh`] stays
+/// valid. Long enough to cover retries of a refresh, short enough that the
+/// authority it grants (cancelling queued intents over these inputs) does
+/// not outlive the trade.
+///
+/// Refresh material persisted for longer than this has an expired delete
+/// proof: cleanup then fails and the caller must prepare and co-sign a
+/// fresh refresh. A signed proof cannot be renewed by changing its message.
+pub const DELETE_PROOF_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often, and how long, to retry deleting a stale intent that arkd
+/// reports as absent. An intent taken into a running batch is not queued
+/// while that batch runs and is queued again if the batch fails.
+pub const STALE_INTENT_DELETE_ATTEMPTS: u32 = 6;
+pub const STALE_INTENT_DELETE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Everything needed to describe an escrow VTXO for refresh.
 #[derive(Debug, Clone)]
@@ -35,6 +52,19 @@ pub struct RefreshIntent {
     pub intent: intent::Intent,
     pub forfeit_psbts: Vec<Psbt>,
     pub refresh_cosigner_pk: secp256k1::PublicKey,
+    /// A `delete` intent over the same inputs, signed by the same parties.
+    ///
+    /// Used to clear a queued intent left behind by an earlier attempt that
+    /// never joined a batch (the server answers "already registered" at
+    /// registration), and to withdraw this attempt's own intent if the
+    /// ceremony fails or times out.
+    ///
+    /// Whoever holds the signed proof can cancel any queued intent spending
+    /// these inputs, repeatedly, until the proof's `expire_at`
+    /// ([`DELETE_PROOF_VALIDITY`] after preparation). It cannot move funds.
+    /// `None` for callers that have not adopted it; then stale intents are
+    /// left for the server to drop.
+    pub delete_intent: Option<intent::Intent>,
 }
 
 impl RefreshIntent {
@@ -51,8 +81,69 @@ impl RefreshIntent {
             intent: delegate.intent,
             forfeit_psbts: delegate.forfeit_psbts,
             refresh_cosigner_pk: delegate.delegate_cosigner_pk,
+            delete_intent: None,
         }
     }
+}
+
+/// Build the unsigned `delete` intent proof for `intent_inputs`, valid for
+/// [`DELETE_PROOF_VALIDITY`] from now.
+fn prepare_delete_intent(intent_inputs: Vec<intent::Input>) -> Result<intent::Intent> {
+    let expire_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .saturating_add(DELETE_PROOF_VALIDITY)
+        .as_secs();
+    // `make_intent` decorates and signs in one go; signing closures that
+    // return nothing leave an unsigned but fully decorated proof, which
+    // `sign_refresh` then signs the same way as the register proof.
+    intent::make_intent(
+        |_, _| Ok(vec![]),
+        |_, _| {
+            Err(ark_core::Error::ad_hoc(
+                "escrow intents have no onchain inputs",
+            ))
+        },
+        intent_inputs,
+        vec![],
+        intent::IntentMessage::Delete { expire_at },
+    )
+    .map_err(|e| anyhow::anyhow!("{e:#}"))
+    .context("preparing delete intent")
+}
+
+/// The delete proof must cover exactly the inputs the register proof
+/// covers, or it cannot clear the intent it is meant to clear. Input 0 of
+/// each proof is the message commitment and is skipped.
+pub(crate) fn ensure_same_inputs(register: &intent::Intent, delete: &intent::Intent) -> Result<()> {
+    let outpoints = |i: &intent::Intent| -> Vec<OutPoint> {
+        let mut v: Vec<OutPoint> = i
+            .proof
+            .unsigned_tx
+            .input
+            .iter()
+            .skip(1)
+            .map(|txin| txin.previous_output)
+            .collect();
+        v.sort();
+        v
+    };
+    anyhow::ensure!(
+        outpoints(register) == outpoints(delete),
+        "delete intent does not cover the same inputs as the refresh intent"
+    );
+    Ok(())
+}
+
+/// Whether a registration error means an earlier intent still holds one of
+/// the inputs.
+pub fn is_stale_intent_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("already registered")
+}
+
+/// Whether a delete error means there was nothing queued to delete.
+pub fn is_no_matching_intent_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("no matching intents")
 }
 
 pub(crate) struct RefreshInput<'a> {
@@ -107,6 +198,7 @@ pub(crate) fn prepare_refresh_resolved(
         value: total_escrow_amount,
     })];
 
+    let delete_intent = prepare_delete_intent(intent_inputs.clone())?;
     let delegate = batch::prepare_delegate_psbts(
         intent_inputs,
         outputs,
@@ -117,14 +209,40 @@ pub(crate) fn prepare_refresh_resolved(
     .map_err(|e| anyhow::anyhow!("{e:#}"))
     .context("preparing refresh PSBTs")?;
 
-    Ok(RefreshIntent::from_delegate(delegate))
+    let mut refresh = RefreshIntent::from_delegate(delegate);
+    refresh.delete_intent = Some(delete_intent);
+    Ok(refresh)
 }
 
-/// Sign refresh PSBTs with a single keypair.
+/// Sign refresh PSBTs (intent proof, forfeits and, if present, the delete
+/// intent proof) with a single keypair.
 pub fn sign_refresh(refresh: &mut RefreshIntent, keypair: &Keypair) -> Result<()> {
     let secp = Secp256k1::new();
     let xonly = keypair.x_only_public_key().0;
+    let sign_fn = |_: &mut bitcoin::psbt::Input,
+                   msg: secp256k1::Message|
+     -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error> {
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, keypair);
+        Ok(vec![(sig, xonly)])
+    };
 
+    batch::sign_delegate_psbts(
+        sign_fn,
+        &mut refresh.intent.proof,
+        &mut refresh.forfeit_psbts,
+    )
+    .map_err(|e| anyhow::anyhow!("{e:#}"))
+    .context("signing refresh PSBTs")?;
+    if let Some(delete) = refresh.delete_intent.as_mut() {
+        sign_delete_intent_proof(&mut delete.proof, keypair)?;
+    }
+    Ok(())
+}
+
+/// Sign a `delete` intent proof with a single keypair.
+pub fn sign_delete_intent_proof(proof: &mut Psbt, keypair: &Keypair) -> Result<()> {
+    let secp = Secp256k1::new();
+    let xonly = keypair.x_only_public_key().0;
     batch::sign_delegate_psbts(
         |_,
          msg: secp256k1::Message|
@@ -132,14 +250,54 @@ pub fn sign_refresh(refresh: &mut RefreshIntent, keypair: &Keypair) -> Result<()
             let sig = secp.sign_schnorr_no_aux_rand(&msg, keypair);
             Ok(vec![(sig, xonly)])
         },
-        &mut refresh.intent.proof,
-        &mut refresh.forfeit_psbts,
+        proof,
+        &mut [],
     )
     .map_err(|e| anyhow::anyhow!("{e:#}"))
-    .context("signing refresh PSBTs")
+    .context("signing delete intent proof")
+}
+
+/// Ask the server to drop every queued intent that spends an input of
+/// `delete_intent`.
+///
+/// Returns `Ok(true)` if something was deleted and `Ok(false)` if nothing
+/// was queued after `max_attempts` tries ([`STALE_INTENT_DELETE_RETRY_DELAY`]
+/// apart). An intent inside a running batch is not queued while that batch
+/// runs; arkd queues it again if the batch fails, so "nothing queued" is not
+/// proof the intent is gone.
+pub async fn delete_intent(
+    grpc: &ark_grpc::Client,
+    delete_intent: intent::Intent,
+    max_attempts: u32,
+) -> Result<bool> {
+    let mut attempt = 1;
+    loop {
+        match grpc.delete_intent(delete_intent.clone()).await {
+            Ok(()) => return Ok(true),
+            Err(e) => {
+                let e = anyhow::anyhow!("{e:#}");
+                if !is_no_matching_intent_error(&e) {
+                    return Err(e.context("deleting intent"));
+                }
+                if attempt >= max_attempts {
+                    tracing::debug!(attempt, "No queued intent to delete");
+                    return Ok(false);
+                }
+                tracing::debug!(attempt, "No queued intent to delete yet; retrying");
+                attempt += 1;
+                tokio::time::sleep(STALE_INTENT_DELETE_RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 /// Execute a signed refresh intent via the Arkade batch ceremony.
+///
+/// If registration fails because an earlier attempt's intent still holds an
+/// input and `refresh.delete_intent` is present, that intent is deleted and
+/// registration retried once. The caller is expected to delete this
+/// attempt's intent if the ceremony fails afterwards; see
+/// [`crate::client::EscrowClient::refresh_escrow`].
 pub async fn execute_refresh<R: Rng + CryptoRng>(
     grpc: &ark_grpc::Client,
     server_info: &server::Info,
@@ -147,15 +305,41 @@ pub async fn execute_refresh<R: Rng + CryptoRng>(
     refresh: RefreshIntent,
     refresh_cosigner_kp: Keypair,
 ) -> Result<Txid> {
+    if let Some(delete) = &refresh.delete_intent {
+        ensure_same_inputs(&refresh.intent, delete)?;
+    }
+    let delete = refresh.delete_intent.clone();
+    let retry = refresh.clone();
     #[allow(deprecated)]
-    crate::delegate::settle_delegate(
+    let first = crate::delegate::settle_delegate(
         grpc,
         server_info,
         rng,
         refresh.into_delegate(),
         refresh_cosigner_kp,
     )
-    .await
+    .await;
+    match (first, delete) {
+        (Err(e), Some(delete)) if is_stale_intent_error(&e) => {
+            tracing::warn!(
+                error = %e,
+                "An input is held by a stale intent; deleting it and retrying registration"
+            );
+            delete_intent(grpc, delete, STALE_INTENT_DELETE_ATTEMPTS)
+                .await
+                .context("deleting the stale intent holding the refresh inputs")?;
+            #[allow(deprecated)]
+            crate::delegate::settle_delegate(
+                grpc,
+                server_info,
+                rng,
+                retry.into_delegate(),
+                refresh_cosigner_kp,
+            )
+            .await
+        }
+        (result, _) => result,
+    }
 }
 
 fn build_intent_inputs(

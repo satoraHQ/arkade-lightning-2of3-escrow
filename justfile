@@ -35,6 +35,7 @@ e2e-rust:
 
 e2e-ruby: build-ruby
     REGTEST_DIR="$(realpath "${REGTEST_DIR:-regtest}")" ruby ruby-ext/e2e/release.rb
+    REGTEST_DIR="$(realpath "${REGTEST_DIR:-regtest}")" ruby ruby-ext/e2e/refresh.rb
 
 regtest-up:
     node regtest/regtest.mjs start --env .env.regtest --profile ark
