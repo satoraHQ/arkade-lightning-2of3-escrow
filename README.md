@@ -107,10 +107,11 @@ require 'ark_escrow'
 # Connect to Arkade (with a custom crash-recovery store)
 client = ArkEscrow::Client.with_custom_store(
   "https://arkade.computer:7070", my_store,
-  timeout_ms: 3_000, refresh_timeout_ms: 120_000
+  timeout_ms: 10_000, refresh_timeout_ms: 120_000
 )
-# Optional: update later; use 0 to disable again.
-client.set_timeout_ms(3_000)
+# Both are optional. Defaults: timeout_ms 30_000, refresh_timeout_ms 120_000.
+# Update later with the setters; 0 disables a timeout.
+client.set_timeout_ms(10_000)
 client.set_refresh_timeout_ms(120_000)
 client.connect
 
@@ -158,6 +159,12 @@ ark_txid = client.spend_escrow_offchain(
 ### Refreshing recoverable VTXOs
 
 When escrow VTXOs become recoverable, first refresh them back into the same escrow contract address. The refreshed escrow then becomes spendable again through the normal offchain signer-set flow. This avoids direct settlement outputs for fees/referrals, which may be sub-dust.
+
+Ordinary requests (connect, VTXO listing, submit, finalize) time out after 30
+seconds by default. Keep this well above the server's typical `submit` latency:
+a timeout that fires after the server accepted a submit leaves the input locked
+until an operator finalizes the recorded spend. `set_timeout(None)` in Rust or
+`timeout_ms: 0` in Ruby disables it.
 
 Refresh uses a separate overall deadline, defaulting to 120 seconds, for intent
 registration and the complete batch ceremony. The ordinary request timeout does
