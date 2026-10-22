@@ -706,6 +706,11 @@ impl EscrowClient {
                         | tonic::Code::PermissionDenied
                         | tonic::Code::Unauthenticated
                 )
+                // arkd answers a re-submit of a transaction it already holds
+                // with `INVALID_ARK_PSBT: duplicated offchain tx <txid>`.
+                // That is the lost-response case, not a rejection: the
+                // record must stay so the operator can finalize it.
+                && !status.message().contains("duplicated offchain tx")
             })
     }
 
@@ -1032,6 +1037,15 @@ mod tests {
                 "{code:?}"
             );
         }
+        // arkd's duplicate-submit answer means the server already holds the
+        // transaction: ambiguous for the record's sake, not a rejection.
+        assert!(!EscrowClient::is_definitive_rejection_for_test(
+            &anyhow::Error::new(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "INVALID_ARK_PSBT (1): duplicated offchain tx 03617dbe"
+            ))
+            .context("submitting")
+        ));
         // No status at all (our own timeout) is ambiguous.
         assert!(!EscrowClient::is_definitive_rejection_for_test(
             &anyhow::anyhow!("submitting offchain transaction timed out after 50ms")

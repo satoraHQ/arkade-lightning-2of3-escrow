@@ -52,9 +52,12 @@ jobs:
         with:
           prefix-key: e2e
 
-      # Build the test binary while the stack is not yet consuming CPU.
+      # Build the test binaries and the Ruby extension while the stack is
+      # not yet consuming CPU.
       - name: Build e2e tests
-        run: cargo test -p ark-escrow --test signer_rotation --no-run
+        run: |
+          cargo test -p ark-escrow --no-run
+          just build-ruby
 
       - name: Start regtest stack
         run: node regtest/regtest.mjs start --env .env.regtest --profile ark
