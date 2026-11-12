@@ -3,12 +3,12 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ark_core::VtxoList;
 use ark_core::batch::Delegate;
 use ark_core::server::{self, GetVtxosRequest};
 use bitcoin::key::Keypair;
-use bitcoin::{OutPoint, Psbt, ScriptBuf, Txid, XOnlyPublicKey};
+use bitcoin::{OutPoint, Psbt, ScriptBuf, TxOut, Txid, XOnlyPublicKey};
 use rand::rngs::OsRng;
 
 use crate::FeeOutput;
@@ -18,6 +18,9 @@ use crate::delegate::DelegateVtxo;
 use crate::refresh::{RefreshInput, RefreshIntent, RefreshVtxo};
 use crate::spend::{self, EscrowVtxo};
 use crate::spend_store::{PendingSpend, SpendStage, SpendStore, psbt_from_base64, psbt_to_base64};
+use crate::verify;
+
+const MAX_INDEXER_PAGES: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct EscrowVtxoStatus {
@@ -28,6 +31,16 @@ pub struct EscrowVtxoStatus {
     pub spendable_offchain: bool,
     pub recoverable: bool,
     pub is_swept: bool,
+    /// The script this VTXO pays: always one of the escrow's candidate scripts, since VTXOs paying
+    /// anything else are dropped when listed. The server can echo a requested script, so this
+    /// proves nothing on its own; [`EscrowClient::verify_escrow_vtxo`] does.
+    pub script: ScriptBuf,
+    /// The commitment transactions the server claims this VTXO descends from. Unverified: it is
+    /// the server's word until the chain is walked and the root checked against Bitcoin.
+    pub commitment_txids: Vec<Txid>,
+    /// Set when the VTXO is not yet a batch-tree leaf, so its funds rest on the server not
+    /// double-spending it before the next settlement.
+    pub is_preconfirmed: bool,
 }
 
 struct ResolvedEscrowVtxo {
@@ -173,6 +186,9 @@ impl EscrowClient {
                 spendable_offchain: true,
                 recoverable: false,
                 is_swept: v.is_swept,
+                script: v.script.clone(),
+                commitment_txids: v.commitment_txids.clone(),
+                is_preconfirmed: v.is_preconfirmed,
             })
             .chain(vtxo_list.recoverable().map(|v| EscrowVtxoStatus {
                 outpoint: v.outpoint,
@@ -182,8 +198,111 @@ impl EscrowClient {
                 spendable_offchain: false,
                 recoverable: true,
                 is_swept: v.is_swept,
+                script: v.script.clone(),
+                commitment_txids: v.commitment_txids.clone(),
+                is_preconfirmed: v.is_preconfirmed,
             }))
             .collect())
+    }
+
+    /// Check that the escrow VTXO at `outpoint` is backed by Bitcoin rather than by the indexer's
+    /// word, see [`crate::verify`].
+    ///
+    /// `l1_outputs` are outputs of the VTXO's commitment transactions, read from Bitcoin by the
+    /// caller. Returns the commitment transactions the VTXO's path starts from; the caller decides
+    /// how deep they must be.
+    pub async fn verify_escrow_vtxo(
+        &self,
+        contract: &EscrowContract,
+        outpoint: OutPoint,
+        l1_outputs: &HashMap<OutPoint, TxOut>,
+    ) -> Result<Vec<Txid>> {
+        let (info, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
+        let vtxo = vtxo_list
+            .all_unspent()
+            .find(|v| v.outpoint == outpoint)
+            .cloned()
+            .with_context(|| format!("escrow VTXO not found: {outpoint}"))?;
+        let operator_keys = std::iter::once(info.signer_pk)
+            .chain(info.deprecated_signers.iter().map(|signer| signer.pk))
+            .map(|pk| pk.x_only_public_key().0)
+            .collect::<Vec<_>>();
+
+        let chains = self.fetch_vtxo_chain(outpoint).await?;
+        let virtual_txids = chains
+            .inner
+            .iter()
+            .filter(|c| !matches!(c.tx_type, server::ChainedTxType::Commitment))
+            .map(|c| c.txid.to_string())
+            .collect();
+        let virtual_txs = self.fetch_virtual_txs(virtual_txids).await?;
+
+        verify::verify_vtxo_chain(
+            outpoint,
+            &vtxo.script,
+            vtxo.amount,
+            &chains,
+            &virtual_txs,
+            l1_outputs,
+            &operator_keys,
+        )
+    }
+
+    async fn fetch_vtxo_chain(&self, outpoint: OutPoint) -> Result<server::VtxoChains> {
+        let mut inner = Vec::new();
+        let mut page_token = None;
+
+        // ponytail: a fixed page cap stops an indexer that never ends the cursor; raise it if
+        // escrow VTXOs ever sit on chains this long.
+        for _ in 0..MAX_INDEXER_PAGES {
+            let response = Self::run_with_timeout(
+                self.timeout,
+                "getting VTXO chain",
+                self.grpc
+                    .get_vtxo_chain(Some(outpoint), None, None, page_token),
+            )
+            .await
+            .context("getting VTXO chain")?;
+            inner.extend(response.chains.inner);
+
+            page_token = response.next_page_token;
+            if page_token.is_none() {
+                return Ok(server::VtxoChains { inner });
+            }
+        }
+
+        bail!("VTXO chain for {outpoint} spans more than {MAX_INDEXER_PAGES} pages")
+    }
+
+    /// The indexer may answer a large request in parts, so ask again for whatever is still
+    /// missing until it stops handing over anything new. What never arrives is reported by
+    /// [`verify::verify_vtxo_chain`] by txid.
+    async fn fetch_virtual_txs(&self, mut missing: Vec<String>) -> Result<Vec<Psbt>> {
+        let mut txs = Vec::new();
+
+        while !missing.is_empty() {
+            let response = Self::run_with_timeout(
+                self.timeout,
+                "getting virtual transactions",
+                self.grpc.get_virtual_txs(missing.clone(), None, None),
+            )
+            .await
+            .context("getting virtual transactions")?;
+
+            let before = missing.len();
+            for psbt in response.txs {
+                let txid = psbt.unsigned_tx.compute_txid().to_string();
+                if let Some(index) = missing.iter().position(|t| *t == txid) {
+                    missing.swap_remove(index);
+                    txs.push(psbt);
+                }
+            }
+            if missing.len() == before {
+                break;
+            }
+        }
+
+        Ok(txs)
     }
 
     /// Find one spendable escrow VTXO by outpoint.
@@ -802,8 +921,37 @@ impl EscrowClient {
                 .await
                 .context("listing VTXOs")?;
 
-        let vtxo_list = VtxoList::new(info.dust, response.vtxos);
+        let vtxos = Self::retain_candidate_vtxos(response.vtxos, &candidates);
+        let vtxo_list = VtxoList::new(info.dust, vtxos);
         Ok((info, candidates, vtxo_list))
+    }
+
+    /// The indexer is asked about the candidate addresses, but nothing makes it answer about those
+    /// only (HH-ARK-111). A VTXO paying any other script is not this escrow's, whatever the
+    /// indexer says, so it is dropped before any funded or recoverable decision sees it.
+    fn retain_candidate_vtxos(
+        vtxos: Vec<server::VirtualTxOutPoint>,
+        candidates: &[EscrowContract],
+    ) -> Vec<server::VirtualTxOutPoint> {
+        let scripts = candidates
+            .iter()
+            .map(EscrowContract::script_pubkey)
+            .collect::<Vec<_>>();
+
+        vtxos
+            .into_iter()
+            .filter(|vtxo| {
+                let ours = scripts.contains(&vtxo.script);
+                if !ours {
+                    tracing::warn!(
+                        outpoint = %vtxo.outpoint,
+                        script = %vtxo.script,
+                        "indexer returned a VTXO that does not pay the escrow; ignoring it"
+                    );
+                }
+                ours
+            })
+            .collect()
     }
 
     fn contract_for_script(
@@ -995,6 +1143,7 @@ mod tests {
     use super::*;
     use crate::contract::EscrowOptions;
     use bitcoin::Network;
+    use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Secp256k1, rand};
 
     fn deprecated_signer(pk: bitcoin::secp256k1::PublicKey) -> server::DeprecatedSigner {
@@ -1099,5 +1248,63 @@ mod tests {
         );
 
         assert_eq!(candidates.len(), 2);
+    }
+
+    fn indexer_vtxo(vout: u32, script: ScriptBuf) -> server::VirtualTxOutPoint {
+        server::VirtualTxOutPoint {
+            outpoint: OutPoint::new(Txid::from_byte_array([1; 32]), vout),
+            created_at: 0,
+            expires_at: 0,
+            amount: bitcoin::Amount::from_sat(50_000),
+            script,
+            is_preconfirmed: false,
+            is_swept: false,
+            is_unrolled: false,
+            is_spent: false,
+            spent_by: None,
+            commitment_txids: Vec::new(),
+            settled_by: None,
+            ark_txid: None,
+            assets: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn vtxos_paying_another_script_are_not_the_escrows() {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let [seller, buyer, arbiter, signer, old_signer] =
+            std::array::from_fn(|_| Keypair::new(&secp, &mut rng));
+
+        let contract = EscrowContract::new(
+            EscrowOptions {
+                seller: seller.x_only_public_key().0,
+                buyer: buyer.x_only_public_key().0,
+                arbiter: arbiter.x_only_public_key().0,
+                server: signer.x_only_public_key().0,
+                unilateral_exit_delay: bitcoin::Sequence(512),
+            },
+            Network::Regtest,
+        )
+        .unwrap();
+        let candidates = EscrowClient::candidate_contracts(
+            &contract,
+            signer.x_only_public_key().0,
+            &[deprecated_signer(old_signer.public_key())],
+        );
+        let foreign = ScriptBuf::new_p2tr(&secp, seller.x_only_public_key().0, None);
+
+        let kept = EscrowClient::retain_candidate_vtxos(
+            vec![
+                indexer_vtxo(0, candidates[0].script_pubkey()),
+                indexer_vtxo(1, foreign),
+                indexer_vtxo(2, candidates[1].script_pubkey()),
+            ],
+            &candidates,
+        );
+
+        let vouts = kept.iter().map(|v| v.outpoint.vout).collect::<Vec<_>>();
+        assert_eq!(vouts, vec![0, 2]);
     }
 }
