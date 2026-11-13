@@ -35,8 +35,8 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 - **`plan_release`** — compute effective payout and fee outputs without building PSBTs
 - **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_refresh`** — Schnorr signing helpers
 - **`merge_ark_tx_sigs`** — merge signatures from multiple parties
-- **`SpendStore`** trait — pluggable crash-recovery storage for the two-phase offchain spend protocol.
-  A record is written *before* `submit` and removed only after `finalize`, guarded by a per-attempt token
+- **`SpendStore`** trait — pluggable crash-recovery storage for the offchain spend protocol.
+  A record is written *before* `submit` and kept as `finalized` afterwards, guarded by a per-attempt token
 
 ### Example
 
@@ -231,9 +231,16 @@ See [docs/protocol.md](docs/protocol.md) for the full PSBT exchange protocol.
 
 `spend_escrow_offchain` writes a `PendingSpend` record **before** the `submit`
 request leaves the process, rewrites it once the server's verified ark tx
-co-signature and checkpoint signatures are in hand, marks it `finalized` after
-`finalize` succeeds, and deletes it only if the server definitively rejects the
-submit. Calling it again with the same `id`, or calling
+co-signature and checkpoint signatures are in hand, marks it `finalized` once
+the server has finalized, and deletes it only if the server definitively
+rejects the submit. The spend is one request: the checkpoints are submitted
+fully party-signed and the server finalizes within `submit` (one-shot submit),
+so the record goes straight from `submitting` to `finalized`. A record only
+passes through `submitted`, followed by a separate `finalize`, when the server
+accepted the spend without finalizing it or when an accepted spend is being
+recovered. See
+[docs/protocol.md](docs/protocol.md) for what one-shot submit trusts the
+server with. Calling it again with the same `id`, or calling
 `resume_pending_spend(id)`, resumes from whatever stage was recorded; a
 finalized record returns its txid without a server call. While a record exists
 the supplied `merged_ark_tx` must be the recorded transaction (same txid) and
@@ -249,19 +256,28 @@ records that are not finalized.
 
 Records written by gem versions before the co-signature check have no
 `server_signed_ark_tx`. If such a record is at `submitted` stage, resuming it
-fails closed rather than releasing checkpoint signatures without evidence.
+fails closed rather than finalizing without evidence.
 
 What this does and does not recover:
 
-- Crash or failed `finalize` after `submit` returned: fully recoverable, the
+- Crash or failed `finalize` on a record at `submitted`: fully recoverable, the
   retry only finalizes.
 - Crash or timeout before the server accepted `submit`: recoverable, the retry
   re-sends the same submit.
 - Timeout or crash after the server accepted `submit` but before its response
-  was read: **not** recoverable by this gem yet. The retry fails with
-  "inputs already locked" and the record stays at `submitting` with the ark txid
-  for operator follow-up. Recovering the server's checkpoint signatures needs
-  `GetPendingTx` with a proof signed by both escrow parties.
+  was read, or a finalized record that could not be written: recoverable. The
+  retry is answered with "duplicated offchain tx"; the gem then reads the
+  co-signed ark tx and the server-signed checkpoints back from the indexer,
+  verifies them, and sends `finalize`, which is a no-op for a spend the server
+  finalized on submit and completes a pending one.
+- The same, against an indexer that does not serve the server's signatures (or
+  is unreachable): **not** recoverable by this gem. The call fails, the record
+  stays at `submitting` with the ark txid, and a later retry tries again.
+  Recovering without the indexer needs `GetPendingTx` with a proof signed by
+  both escrow parties.
+- An error after a one-shot submit does not mean the escrow is unspent: the
+  server may already have finalized. Retry with the same `id` before treating
+  a spend as failed.
 
 A custom store must:
 

@@ -3,10 +3,12 @@
 //!
 //! The server never verifies party signatures; it co-signs the ark tx with a
 //! chosen key (through the same ark-core signing path a real signer uses) and
-//! echoes submitted checkpoints back as "signed". What is under test is the
-//! ordering of store writes relative to the network calls, what a retry does
-//! with each recorded stage, and that party checkpoint signatures are only
-//! released once the server's co-signature has been verified.
+//! returns the checkpoints the way the modelled arkd would: party signatures
+//! dropped (accepted but not finalized), kept and co-signed (one-shot), or merely
+//! echoed. What is under test is the ordering of store writes relative to the
+//! network calls, what a retry does with each recorded stage, when a spend is
+//! recorded as finalized, and how a spend the server already holds is
+//! recovered.
 
 mod support;
 
@@ -260,12 +262,24 @@ async fn successful_spend_keeps_a_finalized_record_and_resumes_without_a_server_
     assert_eq!(txid, spend(&client).txid());
     assert_eq!(
         server.submitted_checkpoint_sigs.load(Ordering::SeqCst),
-        0,
-        "party checkpoint signatures never travel in submit"
+        2,
+        "both parties' checkpoint signatures travel in submit"
+    );
+    assert_eq!(
+        server.finalize_requests.load(Ordering::SeqCst),
+        1,
+        "a server that dropped the signatures is finalized separately"
     );
 
     let finalized = store.load("trade").unwrap().expect("finalized record kept");
     assert_eq!(finalized.stage, SpendStage::Finalized);
+    let checkpoint = psbt_from_base64(&finalized.signed_checkpoints[0]).unwrap();
+    assert_eq!(
+        checkpoint.inputs[0].tap_script_sigs.len(),
+        3,
+        "the party signatures the server dropped are back on the recorded checkpoint, \
+         next to the server's"
+    );
     let cosigned = psbt_from_base64(finalized.server_signed_ark_tx.as_deref().unwrap()).unwrap();
     assert_eq!(
         cosigned.inputs[0].tap_script_sigs.len(),
@@ -285,6 +299,228 @@ async fn successful_spend_keeps_a_finalized_record_and_resumes_without_a_server_
     );
     assert_eq!(server.submit_requests.load(Ordering::SeqCst), submits);
     assert_eq!(server.finalize_requests.load(Ordering::SeqCst), finalizes);
+}
+
+#[tokio::test]
+async fn one_shot_submit_finalizes_without_a_finalize_request() {
+    let server = RefreshServer::start(Behavior::AcceptOneShot).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let txid = run(&client, &store, "trade").await.unwrap();
+    assert_eq!(txid, spend(&client).txid());
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server.submitted_checkpoint_sigs.load(Ordering::SeqCst),
+        2,
+        "both parties' checkpoint signatures travel in submit"
+    );
+    assert_eq!(
+        server.finalize_requests.load(Ordering::SeqCst),
+        0,
+        "the server finalized on submit"
+    );
+
+    let finalized = store.load("trade").unwrap().expect("finalized record kept");
+    assert_eq!(finalized.stage, SpendStage::Finalized);
+    let cosigned = psbt_from_base64(finalized.server_signed_ark_tx.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        cosigned.inputs[0].tap_script_sigs.len(),
+        3,
+        "2 parties + server"
+    );
+    assert_eq!(finalized.signed_checkpoints.len(), 1);
+    let checkpoint = psbt_from_base64(&finalized.signed_checkpoints[0]).unwrap();
+    assert_eq!(
+        checkpoint.inputs[0].tap_script_sigs.len(),
+        3,
+        "2 parties + server"
+    );
+    assert!(finalized.ark_tx.is_none());
+
+    // A retry is answered from the record, without a server call.
+    assert_eq!(run(&client, &store, "trade").await.unwrap(), txid);
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
+}
+
+/// Returning the party signatures is how arkd says "finalized on submit",
+/// but a response that only hands the checkpoints back proves nothing: the
+/// client finalizes separately instead of recording the spend as final.
+#[tokio::test]
+async fn echoed_checkpoints_without_a_server_signature_are_finalized_separately() {
+    let server = RefreshServer::start(Behavior::EchoCheckpoints).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let txid = run(&client, &store, "trade").await.unwrap();
+    assert_eq!(txid, spend(&client).txid());
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server.finalize_requests.load(Ordering::SeqCst),
+        1,
+        "not fully signed checkpoints are not taken as finalized"
+    );
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Finalized
+    );
+}
+
+/// A store that fails the first `failures` conditional writes.
+struct FlakyFinalizedWrite<'a> {
+    inner: &'a FileSpendStore,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+impl SpendStore for FlakyFinalizedWrite<'_> {
+    fn save(&self, spend: &PendingSpend) -> anyhow::Result<()> {
+        self.inner.save(spend)
+    }
+    fn load(&self, id: &str) -> anyhow::Result<Option<PendingSpend>> {
+        self.inner.load(id)
+    }
+    fn remove(&self, id: &str) -> anyhow::Result<()> {
+        self.inner.remove(id)
+    }
+    fn save_if(&self, spend: &PendingSpend) -> anyhow::Result<bool> {
+        let left = self.failures.load(Ordering::SeqCst);
+        if left > 0 {
+            self.failures.store(left - 1, Ordering::SeqCst);
+            anyhow::bail!("store unavailable");
+        }
+        self.inner.save_if(spend)
+    }
+}
+
+#[tokio::test]
+async fn one_shot_finalized_write_is_retried_once() {
+    let server = RefreshServer::start(Behavior::AcceptOneShot).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+    let flaky = FlakyFinalizedWrite {
+        inner: &store,
+        failures: 1.into(),
+    };
+
+    run_spend(&client, &flaky, "trade", spend(&client))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Finalized
+    );
+}
+
+/// The server finalized on submit but the finalized record could not be
+/// written. The call fails, the record stays at `submitting`, and the retry
+/// (which the server answers with "duplicated offchain tx") recovers the
+/// server's signatures from the indexer and records the spend.
+#[tokio::test]
+async fn one_shot_finalized_write_failure_is_recovered_by_a_retry() {
+    let server = RefreshServer::start(Behavior::AcceptOneShot).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+    let flaky = FlakyFinalizedWrite {
+        inner: &store,
+        failures: 2.into(),
+    };
+
+    let error = run_spend(&client, &flaky, "trade", spend(&client))
+        .await
+        .unwrap_err();
+    assert!(
+        chain(&error).contains("was finalized by the server on submit"),
+        "{error:#}"
+    );
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Submitting
+    );
+
+    let holding = RefreshServer::start(Behavior::DuplicateSubmit).await;
+    let client = connect(&holding).await;
+    let txid = client
+        .resume_pending_spend(&store, "trade")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(txid, spend(&client).txid());
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Finalized
+    );
+}
+
+/// A submit the server accepted whose response was lost: the retry is
+/// answered with "duplicated offchain tx". The server's co-signature and
+/// checkpoint signatures are public in the indexer, so the client verifies
+/// them, merges the party signatures and finalizes.
+#[tokio::test]
+async fn a_spend_the_server_already_holds_is_recovered_from_the_indexer() {
+    let server = RefreshServer::start(Behavior::DuplicateSubmit).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let txid = run(&client, &store, "trade").await.unwrap();
+    assert_eq!(txid, spend(&client).txid());
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 1);
+
+    let finalized = store.load("trade").unwrap().unwrap();
+    assert_eq!(finalized.stage, SpendStage::Finalized);
+    let cosigned = psbt_from_base64(finalized.server_signed_ark_tx.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        cosigned.inputs[0].tap_script_sigs.len(),
+        3,
+        "2 parties + server"
+    );
+    let checkpoint = psbt_from_base64(&finalized.signed_checkpoints[0]).unwrap();
+    assert_eq!(
+        checkpoint.inputs[0].tap_script_sigs.len(),
+        3,
+        "2 parties + server"
+    );
+}
+
+/// The indexer does not hand out the server's checkpoint signatures: nothing
+/// is finalized on its word and the record is kept for follow-up.
+#[tokio::test]
+async fn an_indexer_without_the_server_signatures_does_not_recover_the_spend() {
+    let server = RefreshServer::start(Behavior::DuplicateSubmitIndexerWithholds).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let error = run(&client, &store, "trade").await.unwrap_err();
+    let chain = chain(&error);
+    assert!(chain.contains("duplicated offchain tx"), "{chain}");
+    assert!(chain.contains("retained"), "{chain}");
+    assert!(chain.contains("not fully signed"), "{chain}");
+    assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.load("trade").unwrap().unwrap().stage,
+        SpendStage::Submitting
+    );
+}
+
+/// A transaction this client could not verify after the fact never leaves
+/// the process: with one-shot submit the server would finalize it first.
+#[tokio::test]
+async fn a_spend_that_is_not_an_escrow_spend_is_rejected_before_anything_is_sent() {
+    let server = RefreshServer::start(Behavior::AcceptOneShot).await;
+    let client = connect(&server).await;
+    let store = temp_store();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.spend_escrow_offchain(&store, "trade", psbt(1), vec![psbt(2)], &[]),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(chain(&error).contains("nothing was sent"), "{error:#}");
+    assert_eq!(server.submit_requests.load(Ordering::SeqCst), 0);
+    assert!(store.load("trade").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -530,9 +766,13 @@ async fn missing_server_cosignature_withholds_finalize_and_keeps_the_record() {
     let store = temp_store();
 
     let error = run(&client, &store, "trade").await.unwrap_err();
-    assert!(chain(&error).contains("did not co-sign"), "{error:#}");
-    // Party checkpoint signatures were never released, on either leg.
-    assert_eq!(server.submitted_checkpoint_sigs.load(Ordering::SeqCst), 0);
+    // ark-grpc now refuses the response first; our own leaf-key check is the
+    // second line (see `spend::verify_tests`).
+    assert!(
+        chain(&error).contains("missing signature for input 0"),
+        "{error:#}"
+    );
+    // Nothing is finalized or recorded as submitted without the co-signature.
     assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
     let pending = store.load("trade").unwrap().expect("record kept");
     assert_eq!(pending.stage, SpendStage::Submitting);
@@ -578,7 +818,12 @@ async fn a_deprecated_server_key_is_accepted_only_for_a_contract_that_names_it()
     )
     .await
     .unwrap_err();
-    assert!(chain(&error).contains("did not co-sign"), "{error:#}");
+    // ark-grpc now refuses the response first; our own leaf-key check is the
+    // second line (see `spend::verify_tests`).
+    assert!(
+        chain(&error).contains("missing signature for input 0"),
+        "{error:#}"
+    );
     assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
 
     // And a contract on the active key co-signed by the deprecated one.
@@ -587,7 +832,12 @@ async fn a_deprecated_server_key_is_accepted_only_for_a_contract_that_names_it()
     let error = run_spend(&client, &store, "new", spend(&client))
         .await
         .unwrap_err();
-    assert!(chain(&error).contains("did not co-sign"), "{error:#}");
+    // ark-grpc now refuses the response first; our own leaf-key check is the
+    // second line (see `spend::verify_tests`).
+    assert!(
+        chain(&error).contains("missing signature for input 0"),
+        "{error:#}"
+    );
     assert_eq!(server.finalize_requests.load(Ordering::SeqCst), 0);
 }
 

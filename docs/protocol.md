@@ -48,17 +48,17 @@ signatures can be collected before the Arkade server sees the checkpoints.
      │──────────────>│               │
      │               │               │
      │               │ 9.  merge ark_tx sigs
-     │               │ 10. submit(merged_ark_tx, UNSIGNED checkpoints)
+     │               │ 10. merge arbiter + buyer cp sigs into the checkpoints
+     │               │ 11. submit(merged_ark_tx, SIGNED checkpoints)
      │               │──────────────────────────────>│
      │               │               │               │
-     │               │ 11. co-signed ark_tx + server-signed checkpoints
+     │               │ 12. co-signed ark_tx + fully-signed checkpoints
+     │               │     (arkd has finalized at this point)
      │               │<─────────────────────────────│
      │               │               │
-     │               │ 11a. verify server sig on ark_tx (leaf's server key)
-     │               │      → abort here if missing/invalid
-     │               │ 12. merge arbiter cp sigs into server cps
-     │               │ 13. merge buyer cp sigs into server cps
-     │               │ 14. finalize(txid, fully-signed cps)
+     │               │ 13. verify server sig on ark_tx (leaf's server key)
+     │               │      → error if missing/invalid
+     │               │ 14. only if not finalized: finalize(txid, fully-signed cps)
      │               │──────────────────────────────>│
      │               │               │
      │  15. Done — escrow spent      │
@@ -76,27 +76,28 @@ signatures can be collected before the Arkade server sees the checkpoints.
 7. **Buyer signs checkpoints** — `sign_checkpoint(cp, buyer_sk)` for each
 8. **Buyer returns all signed PSBTs** to the arbiter
 9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, buyer_signed)`
-10. **Arbiter submits to Arkade** — `submit(merged_ark_tx, UNSIGNED_checkpoints)` via gRPC. **Only unsigned checkpoints are sent** — checkpoint signatures must not be revealed to the server before it co-signs the ark_tx.
-11. **Arkade returns the co-signed ark_tx and server-signed checkpoints** — server adds its signatures to both
-11a. **Arbiter verifies the server's co-signature** on the ark_tx (`verify_server_ark_tx_sig`): same unsigned transaction, and a valid `Default`-sighash Schnorr signature by the server key named in the escrow leaf being spent. Keys the server merely announces do not count. If the check fails, the flow stops here: no checkpoint signature is ever sent. The canonical co-signed ark_tx (local PSBT plus the verified server signature) is kept in the spend record, through finalization, as the parties' evidence of the server's commitment.
-12. **Arbiter merges its checkpoint sigs** into the server-signed copies
-13. **Arbiter merges Buyer's checkpoint sigs** into the result
-14. **Arbiter finalizes** — `finalize(ark_txid, fully_signed_checkpoints)` via gRPC
+10. **Arbiter merges both parties' checkpoint sigs** into the checkpoints
+11. **Arbiter submits to Arkade** — `submit(merged_ark_tx, signed_checkpoints)` via gRPC (one-shot submit)
+12. **Arkade returns the co-signed ark_tx and the fully-signed checkpoints** — arkd verifies the party signatures, adds its own and finalizes within this call; it signals that by returning the checkpoints still carrying the party signatures. The client only takes that as final if every key of each checkpoint's spend leaf, the server's included, has a valid signature; otherwise it finalizes separately. A one-shot submit the server rejects leaves nothing pending on the server. A timeout or a failed check on the client side says nothing about the server: the spend may already be final.
+13. **Arbiter verifies the server's co-signature** on the ark_tx (`verify_server_ark_tx_sig`): same unsigned transaction, and a valid `Default`-sighash Schnorr signature by the server key named in the escrow leaf being spent. Keys the server merely announces do not count. If the check fails, the call fails and the record stays at `submitting`; on a one-shot server the spend may nevertheless be final, and a retry with the same id recovers it from the indexer. The canonical co-signed ark_tx (local PSBT plus the verified server signature) is kept in the spend record as the parties' evidence of the server's commitment.
+14. **Only if the server did not finalize: Arbiter finalizes** — not expected from arkd, which always runs a version with one-shot submit. If a response nevertheless comes back without fully-signed checkpoints, or an accepted spend is being recovered after a lost response, the client calls `finalize(ark_txid, fully_signed_checkpoints)` so that nothing is left pending
 15. **Done** — escrow VTXO is spent, buyer receives funds at destination
 
-### Security invariant
+### One-shot submit and what it trusts
 
-> Checkpoint signatures (arbiter's and Buyer's) are **never** sent to the
-> Arkade server before the server co-signs the ark_tx. The `submit` call
-> only includes unsigned checkpoints, and `finalize` is only sent after the
-> server's co-signature on the ark_tx has been verified locally. This
-> prevents the server from broadcasting checkpoints unilaterally before
-> committing to the ark transaction.
+> Escrow spends use Arkade's one-shot submit: the checkpoints are sent fully
+> party-signed in `submit` and the server finalizes in the same call. No
+> transaction is left pending between `submit` and `finalize`, which is
+> where a crashed or interrupted client used to strand a spend.
 >
-> Arkade's one-shot submit (checkpoints sent fully signed in `submit`, server
-> finalizes in the same call) is deliberately **not** used for escrow spends:
-> it hands the server the checkpoint signatures before it has committed to
-> anything.
+> The price: checkpoint signatures (arbiter's and Buyer's) reach the Arkade
+> server **before** it returns its co-signature on the ark_tx. A server that
+> kept them without committing to the ark transaction could broadcast the
+> checkpoints unilaterally. Earlier versions withheld the checkpoint
+> signatures until the co-signature had been verified locally (HH-ARK-017);
+> that ordering is given up here. The co-signature is still verified on the
+> response and kept as evidence, but it no longer gates the release of the
+> checkpoint signatures.
 
 ## Seller + Arbiter Flow
 

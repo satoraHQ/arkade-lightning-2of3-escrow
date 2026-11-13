@@ -72,7 +72,7 @@ jobs:
         run: |
           echo "=== block height ==="
           node regtest/regtest.mjs rpc getblockcount 2>&1 || echo "(getblockcount failed)"
-          for c in bitcoin bitcoin-miner fulcrum arkd arkd-wallet; do
+          for c in bitcoin postgres redis fulcrum arkd-signer arkd-wallet arkd; do
             echo "=== docker logs $c ==="
             docker logs "$c" 2>&1 | tail -200 || echo "(container $c not found)"
           done

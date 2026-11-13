@@ -233,9 +233,11 @@ pub fn ark_tx_sighash(
 /// that key makes the leaf spendable. The signature must be a `Default`
 /// sighash Schnorr signature over input 0 of the same unsigned transaction.
 ///
-/// This is the client-side half of the protocol invariant: party checkpoint
-/// signatures are only released (via `finalize`) once the server has
-/// committed to the ark transaction that pays the parties out. Only the
+/// A spend is only recorded as submitted or finalized, and a separate
+/// `finalize` is only sent, once the server has committed to the ark
+/// transaction that pays the parties out. With one-shot
+/// submit the party checkpoint signatures have already been sent by then, so
+/// this check no longer gates their release; it yields the evidence. Only the
 /// verified signature is taken from the server's response; everything else
 /// (party signatures, control blocks, witness data) comes from `local`.
 pub fn verify_server_ark_tx_sig(local: &Psbt, server_signed: &Psbt) -> Result<Psbt> {
@@ -329,6 +331,57 @@ fn escrow_leaf_server_key(psbt: &Psbt, input_index: usize) -> Result<XOnlyPublic
         keys.len()
     );
     Ok(keys[2])
+}
+
+/// Check, before anything is persisted or sent, that an escrow spend has the
+/// shape this client can verify once the server has answered: every input of
+/// the ark tx and of each checkpoint names its prevout and exactly one spend
+/// leaf, and input 0 of the ark tx spends a committed 3-key escrow leaf.
+///
+/// With one-shot submit the server finalizes before the response is
+/// checked, so a transaction that would only fail these checks afterwards
+/// must not be submitted at all.
+pub fn check_spend_shape(ark_tx: &Psbt, checkpoints: &[Psbt]) -> Result<()> {
+    let check_inputs = |what: &str, psbt: &Psbt| -> Result<()> {
+        anyhow::ensure!(
+            !psbt.inputs.is_empty() && psbt.inputs.len() == psbt.unsigned_tx.input.len(),
+            "{what} has no inputs or a mismatched input count"
+        );
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            anyhow::ensure!(
+                input.witness_utxo.is_some(),
+                "{what} input {i} has no witness_utxo"
+            );
+            anyhow::ensure!(
+                input.tap_scripts.len() == 1,
+                "{what} input {i} has {} tap_scripts entries, expected 1",
+                input.tap_scripts.len()
+            );
+        }
+        Ok(())
+    };
+
+    check_inputs("ark tx", ark_tx)?;
+    escrow_leaf_server_key(ark_tx, 0)?;
+    verify_leaf_commitment(ark_tx, 0)?;
+    for (i, checkpoint) in checkpoints.iter().enumerate() {
+        check_inputs(&format!("checkpoint {i}"), checkpoint)?;
+    }
+    Ok(())
+}
+
+/// Check that every `CHECKSIG` key of the spend leaf of each checkpoint
+/// input has a valid signature: both parties and the server.
+///
+/// This is what tells a checkpoint the server really signed from one it
+/// merely handed back.
+pub fn verify_checkpoint_fully_signed(checkpoint: &Psbt) -> Result<()> {
+    ark_core::send::verify_signed_ark_transaction(checkpoint, checkpoint).with_context(|| {
+        format!(
+            "checkpoint {} is not fully signed",
+            checkpoint.unsigned_tx.compute_txid()
+        )
+    })
 }
 
 // --- Signature merging ---

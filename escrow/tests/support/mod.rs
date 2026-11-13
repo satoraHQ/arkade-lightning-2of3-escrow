@@ -24,8 +24,8 @@ pub struct RefreshServer {
     pub submit_requests: Arc<AtomicUsize>,
     /// Number of `FinalizeTx` requests received.
     pub finalize_requests: Arc<AtomicUsize>,
-    /// Total `tap_script_sigs` seen on checkpoints in `SubmitTx` requests.
-    /// Must stay 0: party checkpoint signatures never travel in submit.
+    /// Total `tap_script_sigs` seen on checkpoints in `SubmitTx` requests:
+    /// the party signatures, sent up front for one-shot submit.
     pub submitted_checkpoint_sigs: Arc<AtomicUsize>,
     /// Number of `RegisterIntent` requests received.
     pub register_requests: Arc<AtomicUsize>,
@@ -49,11 +49,29 @@ pub enum Behavior {
     /// `SubmitTx` never answers. The client cannot tell whether it was
     /// accepted.
     StallSubmit,
-    /// `SubmitTx` echoes the submitted PSBTs back as "signed"; `FinalizeTx`
-    /// never answers.
+    /// Like `AcceptSpend`, but `FinalizeTx` never answers.
     StallFinalize,
-    /// `SubmitTx` echoes the submitted PSBTs back; `FinalizeTx` succeeds.
+    /// A server that accepts the spend without finalizing it: `SubmitTx`
+    /// co-signs the ark tx and returns the checkpoints with the party
+    /// signatures dropped; `FinalizeTx` succeeds. arkd does not do this any
+    /// more; it is how the tests reach the `submitted` stage.
     AcceptSpend,
+    /// An arkd with one-shot submit: `SubmitTx` co-signs the ark tx and
+    /// returns the checkpoints still carrying the party signatures plus its
+    /// own, which means it finalized. `FinalizeTx` is not expected.
+    AcceptOneShot,
+    /// `SubmitTx` co-signs the ark tx and hands the checkpoints back exactly
+    /// as submitted: party signatures kept, no server signature. That looks
+    /// like one-shot finalization but proves nothing. `FinalizeTx` succeeds.
+    EchoCheckpoints,
+    /// The server already holds the transaction (an earlier submit was
+    /// accepted): `SubmitTx` answers `duplicated offchain tx`, the indexer
+    /// serves the co-signed ark tx and the server-signed checkpoints, and
+    /// `FinalizeTx` succeeds.
+    DuplicateSubmit,
+    /// Like `DuplicateSubmit`, but the indexer withholds the server's
+    /// signatures on the checkpoints.
+    DuplicateSubmitIndexerWithholds,
     /// `SubmitTx` answers with gRPC `InvalidArgument`.
     RejectSubmit,
     /// `SubmitTx` echoes the PSBTs back without co-signing the ark tx.
@@ -89,20 +107,51 @@ pub fn server_keypair() -> Keypair {
 }
 
 /// Co-sign input 0 of a base64 ark tx PSBT through the same ark-core signing
-/// path a real signer uses, and strip the party data a real server would not
-/// echo back.
+/// path a real signer uses. The party signatures stay on the PSBT, as arkd
+/// returns them: ark-grpc checks every signature of the spend leaf on the
+/// response.
 fn cosign_ark_tx(ark_tx_b64: &str, seed: u8) -> String {
     use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
     let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(ark_tx_b64).unwrap()).unwrap();
-    let party_sigs = std::mem::take(&mut psbt.inputs[0].tap_script_sigs);
+    let before = psbt.inputs[0].tap_script_sigs.len();
     ark_escrow::spend::sign_ark_tx(&mut psbt, &keypair(seed)).unwrap();
-    assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
-    assert!(
-        party_sigs
-            .keys()
-            .all(|k| !psbt.inputs[0].tap_script_sigs.contains_key(k))
-    );
+    assert_eq!(psbt.inputs[0].tap_script_sigs.len(), before + 1);
     STANDARD.encode(psbt.serialize())
+}
+
+/// Add the server's signature to each checkpoint, keeping what is there.
+fn cosign_checkpoints(checkpoints: Vec<String>) -> Vec<String> {
+    use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
+    checkpoints
+        .into_iter()
+        .map(|b64| {
+            let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(b64).unwrap()).unwrap();
+            ark_escrow::spend::sign_checkpoint(&mut psbt, &server_keypair()).unwrap();
+            STANDARD.encode(psbt.serialize())
+        })
+        .collect()
+}
+
+#[derive(Message)]
+struct GetVirtualTxsResponse {
+    #[prost(string, repeated, tag = "1")]
+    txs: Vec<String>,
+}
+
+/// The checkpoints as a server that did not finalize returns them: party
+/// signatures dropped.
+fn strip_checkpoint_sigs(checkpoints: Vec<String>) -> Vec<String> {
+    use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
+    checkpoints
+        .into_iter()
+        .map(|b64| {
+            let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(b64).unwrap()).unwrap();
+            for input in &mut psbt.inputs {
+                input.tap_script_sigs.clear();
+            }
+            STANDARD.encode(psbt.serialize())
+        })
+        .collect()
 }
 
 /// Number of `tap_script_sigs` across all checkpoints in a `SubmitTx` request.
@@ -172,6 +221,8 @@ impl RefreshServer {
         let register_counter = register_requests.clone();
         let delete_requests = Arc::new(AtomicUsize::new(0));
         let delete_counter = delete_requests.clone();
+        // What the indexer serves: the server's view of submitted transactions.
+        let indexed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -183,6 +234,7 @@ impl RefreshServer {
                 let cp_sig_counter = cp_sig_counter.clone();
                 let register_counter = register_counter.clone();
                 let delete_counter = delete_counter.clone();
+                let indexed = indexed.clone();
                 connections.spawn(async move {
                     let mut connection = h2::server::handshake(socket).await.unwrap();
                     let mut requests = JoinSet::new();
@@ -195,6 +247,7 @@ impl RefreshServer {
                         let cp_sig_counter = cp_sig_counter.clone();
                         let register_counter = register_counter.clone();
                         let delete_counter = delete_counter.clone();
+                        let indexed = indexed.clone();
                         requests.spawn(async move {
                             let (parts, mut body) = request.into_parts();
                             let payload = match parts.uri.path() {
@@ -209,6 +262,36 @@ impl RefreshServer {
                                     );
                                     if matches!(behavior, Behavior::StallSubmit) {
                                         std::future::pending::<()>().await;
+                                    }
+                                    if matches!(
+                                        behavior,
+                                        Behavior::DuplicateSubmit
+                                            | Behavior::DuplicateSubmitIndexerWithholds
+                                    ) {
+                                        let checkpoints =
+                                            strip_checkpoint_sigs(req.checkpoint_txs.clone());
+                                        let mut txs = vec![cosign_ark_tx(
+                                            &req.signed_ark_tx,
+                                            ACTIVE_SIGNER_SEED,
+                                        )];
+                                        txs.extend(match behavior {
+                                            Behavior::DuplicateSubmit => {
+                                                cosign_checkpoints(checkpoints)
+                                            }
+                                            _ => checkpoints,
+                                        });
+                                        *indexed.lock().unwrap() = txs;
+                                        let headers = http::Response::builder()
+                                            .header("content-type", "application/grpc")
+                                            .header("grpc-status", "3")
+                                            .header(
+                                                "grpc-message",
+                                                "INVALID_ARK_PSBT (1): duplicated offchain tx abcd",
+                                            )
+                                            .body(())
+                                            .unwrap();
+                                        let _ = response.send_response(headers, true);
+                                        return;
                                     }
                                     if matches!(behavior, Behavior::RejectSubmit) {
                                         let headers = http::Response::builder()
@@ -230,10 +313,22 @@ impl RefreshServer {
                                     SubmitTxResponse {
                                         ark_txid: String::new(),
                                         final_ark_tx,
-                                        signed_checkpoint_txs: req.checkpoint_txs,
+                                        signed_checkpoint_txs: match behavior {
+                                            Behavior::AcceptOneShot => {
+                                                cosign_checkpoints(req.checkpoint_txs)
+                                            }
+                                            Behavior::EchoCheckpoints => req.checkpoint_txs,
+                                            _ => cosign_checkpoints(strip_checkpoint_sigs(
+                                                req.checkpoint_txs,
+                                            )),
+                                        },
                                     }
                                     .encode_to_vec()
                                 }
+                                "/ark.v1.IndexerService/GetVirtualTxs" => GetVirtualTxsResponse {
+                                    txs: indexed.lock().unwrap().clone(),
+                                }
+                                .encode_to_vec(),
                                 "/ark.v1.ArkService/FinalizeTx" => {
                                     finalize_counter.fetch_add(1, Ordering::SeqCst);
                                     if matches!(behavior, Behavior::StallFinalize) {
