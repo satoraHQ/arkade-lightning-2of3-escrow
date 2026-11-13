@@ -443,9 +443,10 @@ impl EscrowClient {
     /// [`SpendStore`].
     ///
     /// Uses Arkade's one-shot submit (the server finalizes within `submit`
-    /// when it receives the checkpoints fully party-signed), falling back to
-    /// a separate `finalize` on servers older than arkd v0.9.25, with a
-    /// persistence guard so that a crash at any point is recoverable.
+    /// when it receives the checkpoints fully party-signed), with a
+    /// persistence guard so that a crash at any point is recoverable. A
+    /// separate `finalize` is only sent when the server accepted the spend
+    /// without finalizing it, so that nothing is left pending.
     ///
     /// # Flow
     ///
@@ -454,8 +455,8 @@ impl EscrowClient {
     ///    finalization.
     /// 2. Otherwise: merge each party's signatures into the checkpoints and
     ///    submit them with the `merged_ark_tx`. If the server finalized on
-    ///    submit, record the spend as finalized. If it is an older server,
-    ///    persist the fully-signed checkpoints, then finalize.
+    ///    submit, record the spend as finalized. If it did not, persist
+    ///    the fully-signed checkpoints, then finalize.
     ///
     /// # Arguments
     ///
@@ -730,8 +731,8 @@ impl EscrowClient {
         first_attempt: bool,
     ) -> Result<Txid> {
         // One-shot submit: the checkpoints go out already carrying every
-        // party signature, so an arkd that supports it (v0.9.25+) co-signs
-        // and finalizes within this one request and no pending transaction
+        // party signature, so arkd co-signs and finalizes within this one
+        // request and no pending transaction
         // is left behind if the process dies afterwards. Nothing has been
         // sent yet if this merge fails.
         let signed_checkpoints =
@@ -857,10 +858,10 @@ impl EscrowClient {
             }
         }
 
-        // An older arkd dropped the party signatures and waits for
-        // `finalize` (or the signatures were recovered after a lost
-        // response). Upgrade the record: from here on a retry only needs to
-        // finalize.
+        // The server holds the spend but has not (verifiably) finalized it:
+        // its response was not fully signed, or the signatures were just
+        // recovered after a lost response. Never leave that pending. Upgrade
+        // the record: from here on a retry only needs to finalize.
         pending.stage = SpendStage::Submitted;
         let saved = match store.save(&pending) {
             Ok(()) => true,
@@ -1184,9 +1185,9 @@ impl EscrowClient {
     /// PSBT plus the server's verified signature), the checkpoint PSBTs as
     /// submitted plus the signatures the server returned, and whether the
     /// server reported finalizing within this request. It reports that by
-    /// returning every checkpoint still carrying the party signatures; an
-    /// older arkd strips them and expects a separate `finalize`. The caller
-    /// checks that the checkpoints are fully signed before relying on it.
+    /// returning every checkpoint still carrying the party signatures. The
+    /// caller checks that the checkpoints are fully signed before relying
+    /// on it, and finalizes separately otherwise.
     ///
     /// Trade-off: the server receives the parties' checkpoint signatures
     /// before it returns its co-signature on the ark tx, so it is trusted

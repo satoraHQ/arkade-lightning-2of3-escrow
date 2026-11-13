@@ -233,11 +233,12 @@ See [docs/protocol.md](docs/protocol.md) for the full PSBT exchange protocol.
 request leaves the process, rewrites it once the server's verified ark tx
 co-signature and checkpoint signatures are in hand, marks it `finalized` once
 the server has finalized, and deletes it only if the server definitively
-rejects the submit. On arkd v0.9.25+ the spend is one request: the checkpoints
-are submitted fully party-signed and the server finalizes within `submit`
-(one-shot submit), so the record goes straight from `submitting` to
-`finalized`. An older server drops the signatures and gets a separate
-`finalize`; only then does a record pass through `submitted`. See
+rejects the submit. The spend is one request: the checkpoints are submitted
+fully party-signed and the server finalizes within `submit` (one-shot submit),
+so the record goes straight from `submitting` to `finalized`. A record only
+passes through `submitted`, followed by a separate `finalize`, when the server
+accepted the spend without finalizing it or when an accepted spend is being
+recovered. See
 [docs/protocol.md](docs/protocol.md) for what one-shot submit trusts the
 server with. Calling it again with the same `id`, or calling
 `resume_pending_spend(id)`, resumes from whatever stage was recorded; a
@@ -259,8 +260,8 @@ fails closed rather than finalizing without evidence.
 
 What this does and does not recover:
 
-- Crash or failed `finalize` after `submit` returned (servers without one-shot
-  submit only): fully recoverable, the retry only finalizes.
+- Crash or failed `finalize` on a record at `submitted`: fully recoverable, the
+  retry only finalizes.
 - Crash or timeout before the server accepted `submit`: recoverable, the retry
   re-sends the same submit.
 - Timeout or crash after the server accepted `submit` but before its response

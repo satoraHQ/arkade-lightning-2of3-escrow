@@ -4,7 +4,7 @@
 //! The server never verifies party signatures; it co-signs the ark tx with a
 //! chosen key (through the same ark-core signing path a real signer uses) and
 //! returns the checkpoints the way the modelled arkd would: party signatures
-//! dropped (no one-shot submit), kept and co-signed (one-shot), or merely
+//! dropped (accepted but not finalized), kept and co-signed (one-shot), or merely
 //! echoed. What is under test is the ordering of store writes relative to the
 //! network calls, what a retry does with each recorded stage, when a spend is
 //! recorded as finalized, and how a spend the server already holds is

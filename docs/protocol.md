@@ -53,12 +53,12 @@ signatures can be collected before the Arkade server sees the checkpoints.
      │               │──────────────────────────────>│
      │               │               │               │
      │               │ 12. co-signed ark_tx + fully-signed checkpoints
-     │               │     (arkd v0.9.25+ has finalized at this point)
+     │               │     (arkd has finalized at this point)
      │               │<─────────────────────────────│
      │               │               │
      │               │ 13. verify server sig on ark_tx (leaf's server key)
      │               │      → error if missing/invalid
-     │               │ 14. older arkd only: finalize(txid, fully-signed cps)
+     │               │ 14. only if not finalized: finalize(txid, fully-signed cps)
      │               │──────────────────────────────>│
      │               │               │
      │  15. Done — escrow spent      │
@@ -78,9 +78,9 @@ signatures can be collected before the Arkade server sees the checkpoints.
 9. **Arbiter merges ark_tx** — `merge_ark_tx_sigs(arbiter_signed, buyer_signed)`
 10. **Arbiter merges both parties' checkpoint sigs** into the checkpoints
 11. **Arbiter submits to Arkade** — `submit(merged_ark_tx, signed_checkpoints)` via gRPC (one-shot submit)
-12. **Arkade returns the co-signed ark_tx and the fully-signed checkpoints** — arkd v0.9.25+ verifies the party signatures, adds its own and finalizes within this call; it signals that by returning the checkpoints still carrying the party signatures. The client only takes that as final if every key of each checkpoint's spend leaf, the server's included, has a valid signature; otherwise it finalizes separately. A one-shot submit the server rejects leaves nothing pending on the server. A timeout or a failed check on the client side says nothing about the server: the spend may already be final.
+12. **Arkade returns the co-signed ark_tx and the fully-signed checkpoints** — arkd verifies the party signatures, adds its own and finalizes within this call; it signals that by returning the checkpoints still carrying the party signatures. The client only takes that as final if every key of each checkpoint's spend leaf, the server's included, has a valid signature; otherwise it finalizes separately. A one-shot submit the server rejects leaves nothing pending on the server. A timeout or a failed check on the client side says nothing about the server: the spend may already be final.
 13. **Arbiter verifies the server's co-signature** on the ark_tx (`verify_server_ark_tx_sig`): same unsigned transaction, and a valid `Default`-sighash Schnorr signature by the server key named in the escrow leaf being spent. Keys the server merely announces do not count. If the check fails, the call fails and the record stays at `submitting`; on a one-shot server the spend may nevertheless be final, and a retry with the same id recovers it from the indexer. The canonical co-signed ark_tx (local PSBT plus the verified server signature) is kept in the spend record as the parties' evidence of the server's commitment.
-14. **Older arkd only: Arbiter finalizes** — an arkd without one-shot submit drops the party signatures and waits; the client then calls `finalize(ark_txid, fully_signed_checkpoints)` as before
+14. **Only if the server did not finalize: Arbiter finalizes** — not expected from arkd, which always runs a version with one-shot submit. If a response nevertheless comes back without fully-signed checkpoints, or an accepted spend is being recovered after a lost response, the client calls `finalize(ark_txid, fully_signed_checkpoints)` so that nothing is left pending
 15. **Done** — escrow VTXO is spent, buyer receives funds at destination
 
 ### One-shot submit and what it trusts

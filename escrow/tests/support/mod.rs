@@ -51,9 +51,10 @@ pub enum Behavior {
     StallSubmit,
     /// Like `AcceptSpend`, but `FinalizeTx` never answers.
     StallFinalize,
-    /// An arkd without one-shot submit: `SubmitTx` co-signs the ark tx and
-    /// returns the checkpoints with the party signatures dropped;
-    /// `FinalizeTx` succeeds.
+    /// A server that accepts the spend without finalizing it: `SubmitTx`
+    /// co-signs the ark tx and returns the checkpoints with the party
+    /// signatures dropped; `FinalizeTx` succeeds. arkd does not do this any
+    /// more; it is how the tests reach the `submitted` stage.
     AcceptSpend,
     /// An arkd with one-shot submit: `SubmitTx` co-signs the ark tx and
     /// returns the checkpoints still carrying the party signatures plus its
@@ -137,7 +138,7 @@ struct GetVirtualTxsResponse {
     txs: Vec<String>,
 }
 
-/// The checkpoints as an arkd without one-shot submit returns them: party
+/// The checkpoints as a server that did not finalize returns them: party
 /// signatures dropped.
 fn strip_checkpoint_sigs(checkpoints: Vec<String>) -> Vec<String> {
     use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};

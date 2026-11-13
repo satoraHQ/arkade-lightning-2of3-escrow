@@ -1,8 +1,9 @@
 //! Persistence for pending offchain spends.
 //!
-//! An Arkade offchain spend is one server call on arkd v0.9.25+ (one-shot
-//! `submit`, which also finalizes) and two on older servers, `submit` then
-//! `finalize`. Once the server has accepted `submit` the inputs are spent or
+//! An Arkade offchain spend is one server call: a one-shot `submit`, which
+//! also finalizes. A separate `finalize` only follows when the server
+//! accepted the spend without finalizing it, or when an accepted spend is
+//! recovered. Once the server has accepted `submit` the inputs are spent or
 //! locked, so a crash or lost response anywhere after the request left the
 //! process must be recoverable from local state. A retry that resubmits
 //! a *new* transaction for the same inputs fails with "inputs already locked".

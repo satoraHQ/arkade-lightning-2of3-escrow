@@ -939,8 +939,8 @@ impl RbClient {
     /// Spend an escrow VTXO offchain with crash recovery.
     ///
     /// Uses Arkade's one-shot submit (the server finalizes within `submit`),
-    /// falling back to a separate `finalize` on servers older than arkd
-    /// v0.9.25, with a persistence guard.
+    /// with a persistence guard. A separate `finalize` is only sent when the
+    /// server accepted the spend without finalizing it.
     ///
     /// - `id` — unique identifier for deduplication (e.g. trade ID).
     /// - `merged_ark_tx_b64` — ark_tx PSBT with all non-server sigs merged.

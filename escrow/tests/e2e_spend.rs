@@ -63,7 +63,7 @@ async fn release_pays_the_buyer_destination() -> Result<()> {
 
 /// One-shot submit against the real server: checkpoints that go out with
 /// both party signatures come back still carrying them, which is arkd's
-/// way of saying it finalized within `SubmitTx` (v0.9.25+). The payout
+/// way of saying it finalized within `SubmitTx`. The payout
 /// arrives without any `FinalizeTx`.
 #[tokio::test]
 #[ignore = "requires local arkade regtest stack"]
