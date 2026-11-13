@@ -7,6 +7,7 @@ pub mod delegate;
 pub mod refresh;
 pub mod spend;
 pub mod spend_store;
+pub mod verify;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FeeOutput {

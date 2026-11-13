@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -6,9 +7,10 @@ use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
 use ark_escrow::refresh::{RefreshIntent, RefreshVtxo};
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStage, SpendStore};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
-use bitcoin::{Amount, Network, OutPoint, Psbt, XOnlyPublicKey};
+use bitcoin::{Address, Amount, Network, OutPoint, Psbt, TxOut, Txid, XOnlyPublicKey};
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::value::Opaque;
@@ -257,6 +259,14 @@ impl RbContract {
     fn address(&self) -> String {
         self.inner.address().to_string()
     }
+
+    /// The contract's script pubkey, hex-encoded.
+    ///
+    /// Callers compare this with the script the server reports for a VTXO before treating that
+    /// VTXO as escrow funds.
+    fn script_pubkey(&self) -> String {
+        self.inner.script_pubkey().to_hex_string()
+    }
 }
 
 /// Ruby class: `ArkEscrow::Client`
@@ -460,12 +470,31 @@ impl RbClient {
 
     /// Find all unspent escrow VTXOs with status metadata for caller-side selection.
     ///
-    /// Returns `[[outpoint, amount_sats, created_at, expires_at, spendable_offchain, recoverable, is_swept], ...]`.
+    /// Returns `[[outpoint, amount_sats, created_at, expires_at, spendable_offchain, recoverable,
+    /// is_swept, script_hex, commitment_txids, is_preconfirmed], ...]`.
+    ///
+    /// Only VTXOs paying one of the escrow's scripts are listed. `commitment_txids` and
+    /// `is_preconfirmed` are the server's claims about the VTXO, not verified facts:
+    /// `commitment_txids` is a lead for `verify_escrow_vtxo`, which checks it against Bitcoin.
     #[allow(clippy::type_complexity)]
     fn find_escrow_vtxo_statuses(
         &self,
         contract: &RbContract,
-    ) -> Result<Vec<(String, u64, i64, i64, bool, bool, bool)>, Error> {
+    ) -> Result<
+        Vec<(
+            String,
+            u64,
+            i64,
+            i64,
+            bool,
+            bool,
+            bool,
+            String,
+            Vec<String>,
+            bool,
+        )>,
+        Error,
+    > {
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let statuses = self
             .rt
@@ -482,9 +511,55 @@ impl RbClient {
                     v.spendable_offchain,
                     v.recoverable,
                     v.is_swept,
+                    v.script.to_hex_string(),
+                    v.commitment_txids.iter().map(ToString::to_string).collect(),
+                    v.is_preconfirmed,
                 )
             })
             .collect())
+    }
+
+    /// Check that the escrow VTXO at `escrow_outpoint` descends, through signed virtual
+    /// transactions, from outputs Bitcoin has.
+    ///
+    /// `l1_outputs` is `[[txid, vout, address, amount_sats], ...]`: outputs of the VTXO's
+    /// commitment transactions as read from Bitcoin, not from Arkade. Returns the txids of the
+    /// commitment transactions the VTXO stands on; the caller requires confirmations on those.
+    /// Raises when the VTXO cannot be traced to them.
+    fn verify_escrow_vtxo(
+        &self,
+        contract: &RbContract,
+        escrow_outpoint: String,
+        l1_outputs: Vec<(String, u32, String, u64)>,
+    ) -> Result<Vec<String>, Error> {
+        let outpoint: OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
+        let client = self.inner.lock().map_err(to_magnus_err)?.clone();
+        let network = client.server_info().map_err(to_magnus_err)?.network;
+
+        let l1_outputs = l1_outputs
+            .into_iter()
+            .map(|(txid, vout, address, amount_sats)| {
+                let txid: Txid = txid.parse().map_err(to_magnus_err)?;
+                let script_pubkey = address
+                    .parse::<Address<NetworkUnchecked>>()
+                    .map_err(to_magnus_err)?
+                    .require_network(network)
+                    .map_err(to_magnus_err)?
+                    .script_pubkey();
+                let txout = TxOut {
+                    value: Amount::from_sat(amount_sats),
+                    script_pubkey,
+                };
+                Ok((OutPoint::new(txid, vout), txout))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
+
+        let commitment_txids = self
+            .rt
+            .block_on(client.verify_escrow_vtxo(&contract.inner, outpoint, &l1_outputs))
+            .map_err(to_magnus_err)?;
+
+        Ok(commitment_txids.iter().map(ToString::to_string).collect())
     }
 
     /// Find all unspent escrow VTXOs and check recoverability.
@@ -1151,6 +1226,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let contract_class = module.define_class("Contract", ruby.class_object())?;
     contract_class.define_singleton_method("new", function!(RbContract::new, 6))?;
     contract_class.define_method("address", method!(RbContract::address, 0))?;
+    contract_class.define_method("script_pubkey", method!(RbContract::script_pubkey, 0))?;
 
     let client_class = module.define_class("Client", ruby.class_object())?;
     client_class
@@ -1186,6 +1262,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     client_class.define_method(
         "find_escrow_vtxo_statuses",
         method!(RbClient::find_escrow_vtxo_statuses, 1),
+    )?;
+    client_class.define_method(
+        "verify_escrow_vtxo",
+        method!(RbClient::verify_escrow_vtxo, 3),
     )?;
     client_class.define_method(
         "find_refresh_vtxos",
