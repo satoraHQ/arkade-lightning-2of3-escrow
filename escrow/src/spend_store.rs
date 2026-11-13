@@ -84,7 +84,8 @@ pub struct PendingSpend {
     /// `submit`. Present while [`SpendStage::Submitting`].
     #[serde(default)]
     pub ark_tx: Option<String>,
-    /// Unsigned checkpoint PSBTs (base64) as sent to `submit`. Present while
+    /// Unsigned checkpoint PSBTs (base64). The party signatures below are
+    /// merged into them for `submit`. Present while
     /// [`SpendStage::Submitting`].
     #[serde(default)]
     pub unsigned_checkpoints: Vec<String>,

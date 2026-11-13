@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use ark_escrow::contract::SignerSet;
 use ark_escrow::spend;
 use ark_escrow::spend_store::{PendingSpend, SpendStage, SpendStore, psbt_to_base64};
+use bitcoin::Psbt;
 use support::regtest::{
     ESCROW_AMOUNT, Parties, REGTEST_LOCK, connect_escrow_client, fund_escrow, sign_spend,
     temp_spend_store, wait_for_exact_contract_amount,
@@ -62,9 +63,8 @@ async fn release_pays_the_buyer_destination() -> Result<()> {
 
 /// One-shot submit against the real server: checkpoints that go out with
 /// both party signatures come back still carrying them, which is arkd's
-/// way of saying it finalized within `SubmitTx` (v0.9.25+). The payout then
-/// arrives without any `FinalizeTx`. An older arkd drops the signatures; the
-/// test then finalizes separately, as the client's fallback does.
+/// way of saying it finalized within `SubmitTx` (v0.9.25+). The payout
+/// arrives without any `FinalizeTx`.
 #[tokio::test]
 #[ignore = "requires local arkade regtest stack"]
 async fn submit_with_signed_checkpoints_is_finalized_by_arkd() -> Result<()> {
@@ -83,33 +83,36 @@ async fn submit_with_signed_checkpoints_is_finalized_by_arkd() -> Result<()> {
         )
         .await?;
     let signed = sign_spend(&release, &escrow.parties.buyer, &escrow.parties.arbiter)?;
-    let ark_txid = signed.merged_ark_tx.unsigned_tx.compute_txid();
-
-    let mut signed_checkpoints = signed.unsigned_checkpoints.clone();
-    for party in &signed.party_checkpoints {
-        for (checkpoint, party_checkpoint) in signed_checkpoints.iter_mut().zip(party) {
-            spend::merge_ark_tx_sigs(checkpoint, party_checkpoint)?;
-        }
-    }
 
     let res = client
         .grpc()
-        .submit_offchain_transaction_request(signed.merged_ark_tx.clone(), signed_checkpoints)
+        .submit_offchain_transaction_request(
+            signed.merged_ark_tx.clone(),
+            party_signed_checkpoints(&signed)?,
+        )
         .await
         .context("one-shot submit")?;
-    eprintln!("arkd finalized on submit: {}", res.finalized);
-    if !res.finalized {
-        client
-            .grpc()
-            .finalize_offchain_transaction(ark_txid, res.signed_checkpoint_txs)
-            .await
-            .context("finalize on an arkd without one-shot submit")?;
+    assert!(res.finalized, "arkd did not finalize on submit");
+    for checkpoint in &res.signed_checkpoint_txs {
+        spend::verify_checkpoint_fully_signed(checkpoint)?;
     }
 
     wait_for_exact_contract_amount(&client, &destination, ESCROW_AMOUNT)
         .await
         .context("released amount did not arrive at the buyer destination")?;
     Ok(())
+}
+
+/// The checkpoints as the client submits them: both parties' signatures
+/// merged in.
+fn party_signed_checkpoints(signed: &support::regtest::SignedSpend) -> Result<Vec<Psbt>> {
+    let mut checkpoints = signed.unsigned_checkpoints.clone();
+    for party in &signed.party_checkpoints {
+        for (checkpoint, party_checkpoint) in checkpoints.iter_mut().zip(party) {
+            spend::merge_ark_tx_sigs(checkpoint, party_checkpoint)?;
+        }
+    }
+    Ok(checkpoints)
 }
 
 #[tokio::test]
@@ -147,14 +150,15 @@ async fn refund_pays_the_seller_destination() -> Result<()> {
     Ok(())
 }
 
-/// The HH-ARK-023 scenario: arkd accepted `submit` but the response never
-/// reached the process (timeout, crash). arkd answers the re-submit with
-/// `INVALID_ARK_PSBT: duplicated offchain tx <txid>` and keeps the input
-/// locked; the record must survive so an operator can still finalize.
-#[tokio::test]
-#[ignore = "requires local arkade regtest stack"]
-async fn lost_submit_response_keeps_the_record_and_the_input_stays_locked() -> Result<()> {
-    let _guard = REGTEST_LOCK.lock().await;
+/// The HH-ARK-023 scenario: the server accepted a submit whose response the
+/// client never recorded (timeout, crash).
+/// arkd answers the re-submit with `INVALID_ARK_PSBT: duplicated offchain tx
+/// <txid>`; the client then reads the co-signed ark tx and the server-signed
+/// checkpoints back from the indexer, verifies them and finalizes.
+///
+/// `one_shot` picks what the lost submit was: with party-signed checkpoints
+/// arkd finalized it on the spot, with unsigned ones it is left pending.
+async fn lost_submit_response_is_recovered(one_shot: bool) -> Result<()> {
     let client = connect_escrow_client().await?;
     let escrow = fund_escrow(&client).await?;
     let destination = Parties::random().contract(&client)?;
@@ -171,16 +175,19 @@ async fn lost_submit_response_keeps_the_record_and_the_input_stays_locked() -> R
     let signed = sign_spend(&release, &escrow.parties.buyer, &escrow.parties.arbiter)?;
     let ark_txid = signed.merged_ark_tx.unsigned_tx.compute_txid();
 
-    // The "lost" submit: arkd accepts and locks the input; the response is
-    // never seen by the store.
-    client
+    // The "lost" submit: arkd accepts it; the response is never seen by the
+    // store.
+    let checkpoints = if one_shot {
+        party_signed_checkpoints(&signed)?
+    } else {
+        signed.unsigned_checkpoints.clone()
+    };
+    let lost = client
         .grpc()
-        .submit_offchain_transaction_request(
-            signed.merged_ark_tx.clone(),
-            signed.unsigned_checkpoints.clone(),
-        )
+        .submit_offchain_transaction_request(signed.merged_ark_tx.clone(), checkpoints)
         .await
         .context("first (lost) submit")?;
+    assert_eq!(lost.finalized, one_shot);
 
     // What the client had persisted before that submit went out.
     let store = temp_spend_store()?;
@@ -204,24 +211,22 @@ async fn lost_submit_response_keeps_the_record_and_the_input_stays_locked() -> R
         server_signed_ark_tx: None,
     })?;
 
-    // The retry resumes the record and re-sends the same submit.
-    let error = client
+    // The retry resumes the record, is told the server already holds the
+    // transaction, and completes it.
+    let txid = client
         .resume_pending_spend(&store, "lost")
         .await
-        .expect_err("re-submitting an accepted transaction must not succeed");
-    let chain = format!("{error:#}");
-    eprintln!("arkd on duplicate submit: {chain}");
-    assert!(chain.contains("duplicated offchain tx"), "{chain}");
-    assert!(chain.contains("retained"), "{chain}");
+        .context("resuming a spend the server already holds")?;
+    assert_eq!(txid, Some(ark_txid));
 
-    let record = store.load("lost")?.context("record must survive")?;
-    assert_eq!(record.stage, SpendStage::Submitting);
+    let record = store.load("lost")?.context("record kept")?;
+    assert_eq!(record.stage, SpendStage::Finalized);
     assert_eq!(record.token, "attempt-1");
+    assert!(record.server_signed_ark_tx.is_some());
 
-    // The same answer on a first attempt (record lost as well) must also
-    // keep the record: a duplicate means arkd holds our transaction.
+    // The same on a first attempt, when the record was lost as well.
     let fresh = temp_spend_store()?;
-    let error = client
+    let txid = client
         .spend_escrow_offchain(
             &fresh,
             "lost-again",
@@ -230,22 +235,31 @@ async fn lost_submit_response_keeps_the_record_and_the_input_stays_locked() -> R
             &[&signed.party_checkpoints[0], &signed.party_checkpoints[1]],
         )
         .await
-        .expect_err("duplicate");
-    assert!(format!("{error:#}").contains("retained"), "{error:#}");
+        .context("first attempt for a spend the server already holds")?;
+    assert_eq!(txid, ark_txid);
     assert_eq!(
         fresh.load("lost-again")?.context("record kept")?.stage,
-        SpendStage::Submitting
+        SpendStage::Finalized
     );
 
-    // arkd still holds the input locked by the first submit.
-    assert!(
-        client
-            .find_spendable_escrow_vtxos(&escrow.contract)
-            .await?
-            .is_empty(),
-        "arkd should still hold the input locked by the first submit"
-    );
+    wait_for_exact_contract_amount(&client, &destination, ESCROW_AMOUNT)
+        .await
+        .context("released amount did not arrive at the buyer destination")?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires local arkade regtest stack"]
+async fn lost_response_of_a_one_shot_submit_is_recovered() -> Result<()> {
+    let _guard = REGTEST_LOCK.lock().await;
+    lost_submit_response_is_recovered(true).await
+}
+
+#[tokio::test]
+#[ignore = "requires local arkade regtest stack"]
+async fn lost_response_of_a_pending_submit_is_recovered() -> Result<()> {
+    let _guard = REGTEST_LOCK.lock().await;
+    lost_submit_response_is_recovered(false).await
 }
 
 /// Crash between `submit` and `finalize`: the record is at `submitted`,

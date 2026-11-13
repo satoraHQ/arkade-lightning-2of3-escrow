@@ -56,9 +56,21 @@ pub enum Behavior {
     /// `FinalizeTx` succeeds.
     AcceptSpend,
     /// An arkd with one-shot submit: `SubmitTx` co-signs the ark tx and
-    /// returns the checkpoints still carrying the party signatures, which
-    /// means it finalized. `FinalizeTx` is not expected.
+    /// returns the checkpoints still carrying the party signatures plus its
+    /// own, which means it finalized. `FinalizeTx` is not expected.
     AcceptOneShot,
+    /// `SubmitTx` co-signs the ark tx and hands the checkpoints back exactly
+    /// as submitted: party signatures kept, no server signature. That looks
+    /// like one-shot finalization but proves nothing. `FinalizeTx` succeeds.
+    EchoCheckpoints,
+    /// The server already holds the transaction (an earlier submit was
+    /// accepted): `SubmitTx` answers `duplicated offchain tx`, the indexer
+    /// serves the co-signed ark tx and the server-signed checkpoints, and
+    /// `FinalizeTx` succeeds.
+    DuplicateSubmit,
+    /// Like `DuplicateSubmit`, but the indexer withholds the server's
+    /// signatures on the checkpoints.
+    DuplicateSubmitIndexerWithholds,
     /// `SubmitTx` answers with gRPC `InvalidArgument`.
     RejectSubmit,
     /// `SubmitTx` echoes the PSBTs back without co-signing the ark tx.
@@ -104,6 +116,25 @@ fn cosign_ark_tx(ark_tx_b64: &str, seed: u8) -> String {
     ark_escrow::spend::sign_ark_tx(&mut psbt, &keypair(seed)).unwrap();
     assert_eq!(psbt.inputs[0].tap_script_sigs.len(), before + 1);
     STANDARD.encode(psbt.serialize())
+}
+
+/// Add the server's signature to each checkpoint, keeping what is there.
+fn cosign_checkpoints(checkpoints: Vec<String>) -> Vec<String> {
+    use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
+    checkpoints
+        .into_iter()
+        .map(|b64| {
+            let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(b64).unwrap()).unwrap();
+            ark_escrow::spend::sign_checkpoint(&mut psbt, &server_keypair()).unwrap();
+            STANDARD.encode(psbt.serialize())
+        })
+        .collect()
+}
+
+#[derive(Message)]
+struct GetVirtualTxsResponse {
+    #[prost(string, repeated, tag = "1")]
+    txs: Vec<String>,
 }
 
 /// The checkpoints as an arkd without one-shot submit returns them: party
@@ -189,6 +220,8 @@ impl RefreshServer {
         let register_counter = register_requests.clone();
         let delete_requests = Arc::new(AtomicUsize::new(0));
         let delete_counter = delete_requests.clone();
+        // What the indexer serves: the server's view of submitted transactions.
+        let indexed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -200,6 +233,7 @@ impl RefreshServer {
                 let cp_sig_counter = cp_sig_counter.clone();
                 let register_counter = register_counter.clone();
                 let delete_counter = delete_counter.clone();
+                let indexed = indexed.clone();
                 connections.spawn(async move {
                     let mut connection = h2::server::handshake(socket).await.unwrap();
                     let mut requests = JoinSet::new();
@@ -212,6 +246,7 @@ impl RefreshServer {
                         let cp_sig_counter = cp_sig_counter.clone();
                         let register_counter = register_counter.clone();
                         let delete_counter = delete_counter.clone();
+                        let indexed = indexed.clone();
                         requests.spawn(async move {
                             let (parts, mut body) = request.into_parts();
                             let payload = match parts.uri.path() {
@@ -226,6 +261,36 @@ impl RefreshServer {
                                     );
                                     if matches!(behavior, Behavior::StallSubmit) {
                                         std::future::pending::<()>().await;
+                                    }
+                                    if matches!(
+                                        behavior,
+                                        Behavior::DuplicateSubmit
+                                            | Behavior::DuplicateSubmitIndexerWithholds
+                                    ) {
+                                        let checkpoints =
+                                            strip_checkpoint_sigs(req.checkpoint_txs.clone());
+                                        let mut txs = vec![cosign_ark_tx(
+                                            &req.signed_ark_tx,
+                                            ACTIVE_SIGNER_SEED,
+                                        )];
+                                        txs.extend(match behavior {
+                                            Behavior::DuplicateSubmit => {
+                                                cosign_checkpoints(checkpoints)
+                                            }
+                                            _ => checkpoints,
+                                        });
+                                        *indexed.lock().unwrap() = txs;
+                                        let headers = http::Response::builder()
+                                            .header("content-type", "application/grpc")
+                                            .header("grpc-status", "3")
+                                            .header(
+                                                "grpc-message",
+                                                "INVALID_ARK_PSBT (1): duplicated offchain tx abcd",
+                                            )
+                                            .body(())
+                                            .unwrap();
+                                        let _ = response.send_response(headers, true);
+                                        return;
                                     }
                                     if matches!(behavior, Behavior::RejectSubmit) {
                                         let headers = http::Response::builder()
@@ -248,12 +313,21 @@ impl RefreshServer {
                                         ark_txid: String::new(),
                                         final_ark_tx,
                                         signed_checkpoint_txs: match behavior {
-                                            Behavior::AcceptOneShot => req.checkpoint_txs,
-                                            _ => strip_checkpoint_sigs(req.checkpoint_txs),
+                                            Behavior::AcceptOneShot => {
+                                                cosign_checkpoints(req.checkpoint_txs)
+                                            }
+                                            Behavior::EchoCheckpoints => req.checkpoint_txs,
+                                            _ => cosign_checkpoints(strip_checkpoint_sigs(
+                                                req.checkpoint_txs,
+                                            )),
                                         },
                                     }
                                     .encode_to_vec()
                                 }
+                                "/ark.v1.IndexerService/GetVirtualTxs" => GetVirtualTxsResponse {
+                                    txs: indexed.lock().unwrap().clone(),
+                                }
+                                .encode_to_vec(),
                                 "/ark.v1.ArkService/FinalizeTx" => {
                                     finalize_counter.fetch_add(1, Ordering::SeqCst);
                                     if matches!(behavior, Behavior::StallFinalize) {

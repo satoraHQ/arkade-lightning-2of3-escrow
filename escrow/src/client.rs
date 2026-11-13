@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -479,13 +478,16 @@ impl EscrowClient {
     ///
     /// A record at the `submitting` stage is re-submitted as recorded. If the
     /// server had already accepted the original request (response lost in
-    /// flight), the re-submit fails with "duplicated offchain tx" and the
-    /// record is kept for operator follow-up. On a server with one-shot
-    /// submit the spend is then already finalized and only the record is
-    /// stale. On an older server the transaction is pending and the server's
-    /// checkpoint signatures only exist in the lost response; recovering
-    /// them needs `GetPendingTx` with a proof signed by both escrow parties,
-    /// which this crate does not implement yet.
+    /// flight), it answers "duplicated offchain tx". The client then reads
+    /// the co-signed ark tx and the server-signed checkpoints back from the
+    /// indexer, verifies them, and sends `finalize`: a no-op if the server
+    /// finalized on submit, the missing step if the transaction was pending.
+    ///
+    /// That recovery needs an indexer that serves the server's signatures.
+    /// If it withholds them (or is unreachable), the call fails, the record
+    /// is kept at `submitting`, and a later retry tries again; recovering
+    /// without the indexer would need `GetPendingTx` with a proof signed by
+    /// both escrow parties, which this crate does not implement.
     ///
     /// [`resume_pending_spend`]: EscrowClient::resume_pending_spend
     /// - `merged_ark_tx` — the ark_tx PSBT with all non-server signatures
@@ -527,9 +529,12 @@ impl EscrowClient {
             return self.resume_recorded(store, pending).await;
         }
 
-        // Validate everything that could make the post-submit merge fail
-        // before persisting or sending anything: once the server has
-        // accepted the submit, a merge failure would strand its signatures.
+        // Validate everything that could fail locally after the server has
+        // accepted the submit, before persisting or sending anything: with
+        // one-shot submit the spend is final by the time the response is
+        // checked, so a transaction this client cannot verify must not go out.
+        spend::check_spend_shape(&merged_ark_tx, &unsigned_checkpoints)
+            .context("escrow spend is not in the expected shape; nothing was sent")?;
         let expected = unsigned_checkpoints.len();
         anyhow::ensure!(expected > 0, "no checkpoints to submit");
         for (i, party_cps) in party_signed_checkpoints.iter().enumerate() {
@@ -618,9 +623,9 @@ impl EscrowClient {
                 Ok(ark_txid)
             }
             SpendStage::Submitted => {
-                // Fail closed: finalizing releases the parties' checkpoint
-                // signatures, so the stored evidence of the server's
-                // commitment is checked again here. A record without it
+                // Fail closed: a record is only driven to `finalized` on
+                // evidence of the server's commitment, so the stored
+                // co-signature is checked again here. A record without it
                 // predates the check (or was tampered with).
                 let evidence = pending
                     .server_signed_ark_tx
@@ -734,13 +739,52 @@ impl EscrowClient {
                 .context("merging party checkpoint signatures before submit")?;
 
         let (ark_txid, server_signed_ark_tx, final_checkpoints, finalized) = match self
-            .submit_internal(merged_ark_tx, signed_checkpoints)
+            .submit_internal(merged_ark_tx.clone(), signed_checkpoints.clone())
             .await
         {
             Ok(res) => res,
+            Err(e) if Self::is_duplicate_submit(&e) => {
+                // The server already holds this transaction: an earlier
+                // submit was accepted and its response never recorded. What
+                // that response carried is public in the indexer, so rebuild
+                // it from there and carry on as if it had just arrived. The
+                // `finalize` that follows is a no-op on a transaction the
+                // server finalized on submit, and completes a pending one.
+                match self
+                    .recover_accepted_submit(&merged_ark_tx, &signed_checkpoints)
+                    .await
+                {
+                    Ok((cosigned_ark_tx, checkpoints)) => {
+                        tracing::info!(
+                            ark_txid = %pending.ark_txid,
+                            "Server already holds this spend; recovered its signatures from the indexer"
+                        );
+                        (
+                            merged_ark_tx.unsigned_tx.compute_txid(),
+                            cosigned_ark_tx,
+                            checkpoints,
+                            false,
+                        )
+                    }
+                    Err(recover_err) => {
+                        return Err(e.context(format!(
+                            "submitting offchain transaction {} (the server already holds it; \
+                             pending record {} retained; recovering the server's signatures \
+                             from the indexer failed: {recover_err:#})",
+                            pending.ark_txid, pending.id
+                        )));
+                    }
+                }
+            }
             Err(e) if first_attempt && Self::is_definitive_rejection(&e) => {
                 // The server answered and said no: nothing is locked on its
                 // side, so a retry with corrected data must not replay this.
+                // The party-signed checkpoints did travel with the request.
+                tracing::warn!(
+                    ark_txid = %pending.ark_txid,
+                    id = %pending.id,
+                    "Server rejected a submit that carried the parties' checkpoint signatures"
+                );
                 let cleared = store
                     .remove_if(&pending.id, &pending.token)
                     .context("clearing rejected spend record")?;
@@ -778,20 +822,45 @@ impl EscrowClient {
         pending.unsigned_checkpoints.clear();
         pending.party_signed_checkpoints.clear();
 
+        // "Finalized on submit" is read off the response: the server returned
+        // the checkpoints still carrying the party signatures. Only believe
+        // it if the checkpoints are also fully signed, server included. A
+        // response that merely echoes them back is finalized separately,
+        // which either completes the spend or says why it is not final.
+        let fully_signed = final_checkpoints
+            .iter()
+            .try_for_each(spend::verify_checkpoint_fully_signed);
         if finalized {
-            tracing::info!(%ark_txid, "Offchain TX finalized on submit (one-shot)");
-            return Self::record_finalized(store, &pending, ark_txid).with_context(|| {
-                format!(
-                    "offchain transaction {ark_txid} was finalized by the server on submit, \
-                     but the record for {} could not be updated",
-                    pending.id
-                )
-            });
+            match fully_signed {
+                Ok(()) => {
+                    tracing::info!(%ark_txid, "Offchain TX finalized on submit (one-shot)");
+                    // A failed write would leave a final spend looking
+                    // pending, so try twice. If both fail, a retry with the
+                    // same id recovers through the duplicate-submit path.
+                    return Self::record_finalized(store, &pending, ark_txid)
+                        .or_else(|_| Self::record_finalized(store, &pending, ark_txid))
+                        .with_context(|| {
+                            format!(
+                                "offchain transaction {ark_txid} was finalized by the server on \
+                                 submit, but the record for {} could not be updated; retry with \
+                                 the same id to record it",
+                                pending.id
+                            )
+                        });
+                }
+                Err(e) => tracing::warn!(
+                    %ark_txid,
+                    error = %format!("{e:#}"),
+                    "Server kept the party signatures on the checkpoints but they are not \
+                     fully signed; finalizing separately"
+                ),
+            }
         }
 
         // An older arkd dropped the party signatures and waits for
-        // `finalize`. Upgrade the record: from here on a retry only needs
-        // to finalize.
+        // `finalize` (or the signatures were recovered after a lost
+        // response). Upgrade the record: from here on a retry only needs to
+        // finalize.
         pending.stage = SpendStage::Submitted;
         let saved = match store.save(&pending) {
             Ok(()) => true,
@@ -855,9 +924,74 @@ impl EscrowClient {
                 // arkd answers a re-submit of a transaction it already holds
                 // with `INVALID_ARK_PSBT: duplicated offchain tx <txid>`.
                 // That is the lost-response case, not a rejection: the
-                // record must stay so the operator can finalize it.
+                // record must stay (see `recover_accepted_submit`).
                 && !status.message().contains("duplicated offchain tx")
             })
+    }
+
+    /// Whether `err` is arkd saying it already holds this very transaction.
+    fn is_duplicate_submit(err: &anyhow::Error) -> bool {
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+            .is_some_and(|status| status.message().contains("duplicated offchain tx"))
+    }
+
+    /// Rebuild the response of a submit the server accepted earlier from the
+    /// indexer: the co-signed ark tx and the checkpoints with the server's
+    /// signatures, merged onto `signed_checkpoints` (which carry the party
+    /// signatures).
+    ///
+    /// Nothing the indexer says is taken on trust. The ark tx must be our
+    /// transaction with a valid co-signature by the leaf's server key, the
+    /// checkpoints must be exactly ours, and after merging every key of each
+    /// checkpoint's spend leaf must have a valid signature. An indexer that
+    /// withholds the server's signatures therefore fails here and the record
+    /// stays as it is.
+    async fn recover_accepted_submit(
+        &self,
+        ark_tx: &Psbt,
+        signed_checkpoints: &[Psbt],
+    ) -> Result<(Psbt, Vec<Psbt>)> {
+        let ark_txid = ark_tx.unsigned_tx.compute_txid();
+        let checkpoint_txids: Vec<Txid> = signed_checkpoints
+            .iter()
+            .map(|cp| cp.unsigned_tx.compute_txid())
+            .collect();
+        let wanted = std::iter::once(ark_txid)
+            .chain(checkpoint_txids.iter().copied())
+            .map(|txid| txid.to_string())
+            .collect();
+
+        let fetched = Self::run_with_timeout(
+            self.timeout,
+            "getting virtual transactions",
+            self.grpc.get_virtual_txs(wanted, None, None),
+        )
+        .await
+        .context("getting the accepted spend from the indexer")?
+        .txs;
+
+        let server_ark_tx = fetched
+            .iter()
+            .find(|tx| tx.unsigned_tx.compute_txid() == ark_txid)
+            .with_context(|| format!("indexer did not return ark tx {ark_txid}"))?;
+        let cosigned_ark_tx = spend::verify_server_ark_tx_sig(ark_tx, server_ark_tx)
+            .context("verifying server co-signature on the ark tx from the indexer")?;
+
+        let server_checkpoints = fetched
+            .iter()
+            .filter(|tx| checkpoint_txids.contains(&tx.unsigned_tx.compute_txid()))
+            .cloned()
+            .collect();
+        let checkpoints =
+            ark_core::send::bind_checkpoint_transactions(signed_checkpoints, server_checkpoints)
+                .context("matching the indexer's checkpoints to the submitted ones")?;
+        checkpoints
+            .iter()
+            .try_for_each(spend::verify_checkpoint_fully_signed)
+            .context("checkpoints from the indexer are not fully signed")?;
+
+        Ok((cosigned_ark_tx, checkpoints))
     }
 
     #[cfg(test)]
@@ -1047,11 +1181,12 @@ impl EscrowClient {
     /// server (one-shot submit).
     ///
     /// Returns the ark txid, the canonical co-signed ark tx (the submitted
-    /// PSBT plus the server's verified signature), the fully-signed
-    /// checkpoint PSBTs (with witness_scripts restored) and whether the
-    /// server finalized the transaction within this request. It did if it
-    /// returned every checkpoint still carrying the party signatures; an
-    /// older arkd strips them and expects a separate `finalize`.
+    /// PSBT plus the server's verified signature), the checkpoint PSBTs as
+    /// submitted plus the signatures the server returned, and whether the
+    /// server reported finalizing within this request. It reports that by
+    /// returning every checkpoint still carrying the party signatures; an
+    /// older arkd strips them and expects a separate `finalize`. The caller
+    /// checks that the checkpoints are fully signed before relying on it.
     ///
     /// Trade-off: the server receives the parties' checkpoint signatures
     /// before it returns its co-signature on the ark tx, so it is trusted
@@ -1078,31 +1213,15 @@ impl EscrowClient {
             .context("verifying server co-signature on ark transaction")?;
         tracing::debug!(%ark_txid, "Server co-signed ark transaction");
 
-        // Build a map from original checkpoint txid → witness_script so we can
-        // restore witness_script on the server-returned checkpoints (the server
-        // may strip it).
-        let witness_scripts: HashMap<Txid, _> = checkpoint_txs
-            .iter()
-            .map(|cp| {
-                let txid = cp.unsigned_tx.compute_txid();
-                let ws = cp.inputs[0].witness_script.clone();
-                (txid, ws)
-            })
-            .collect();
-
-        let signed_checkpoints = res
-            .signed_checkpoint_txs
-            .into_iter()
-            .map(|mut cp| {
-                let txid = cp.unsigned_tx.compute_txid();
-                if let Some(ws) = witness_scripts.get(&txid) {
-                    cp.inputs[0].witness_script = ws.clone();
-                }
-                cp
-            })
-            .collect();
-
-        Ok((ark_txid, cosigned_ark_tx, signed_checkpoints, res.finalized))
+        // ark-grpc binds the returned checkpoints to the submitted ones by
+        // txid: each is the submitted PSBT (witness script, spend leaf and
+        // party signatures intact) plus the signatures the server returned.
+        Ok((
+            ark_txid,
+            cosigned_ark_tx,
+            res.signed_checkpoint_txs,
+            res.finalized,
+        ))
     }
 
     /// Finalize the offchain transaction with fully-signed checkpoint PSBTs.
@@ -1142,25 +1261,26 @@ impl EscrowClient {
         }
     }
 
-    /// Merge server-signed checkpoints with each party's signed checkpoints.
+    /// Merge each party's signed checkpoints into the checkpoints that are
+    /// about to be submitted.
     ///
-    /// For each checkpoint position, starts from the server-signed PSBT and
-    /// merges in every party's `tap_script_sigs`.
+    /// For each checkpoint position, starts from the base PSBT and merges in
+    /// every party's `tap_script_sigs`.
     fn merge_all_checkpoint_sigs(
-        server_checkpoints: &[Psbt],
+        checkpoints: &[Psbt],
         party_signed_checkpoints: &[&[Psbt]],
     ) -> Result<Vec<Psbt>> {
-        server_checkpoints
+        checkpoints
             .iter()
             .enumerate()
-            .map(|(i, server_cp)| {
-                let mut merged = server_cp.clone();
+            .map(|(i, checkpoint)| {
+                let mut merged = checkpoint.clone();
                 for party_cps in party_signed_checkpoints {
                     anyhow::ensure!(
-                        party_cps.len() == server_checkpoints.len(),
+                        party_cps.len() == checkpoints.len(),
                         "party has {} checkpoints, expected {}",
                         party_cps.len(),
-                        server_checkpoints.len(),
+                        checkpoints.len(),
                     );
                     spend::merge_ark_tx_sigs(&mut merged, &party_cps[i])?;
                 }

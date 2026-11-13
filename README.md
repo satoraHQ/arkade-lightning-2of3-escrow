@@ -35,8 +35,8 @@ ark-escrow = { git = "https://github.com/lendasat/ark-escrow" }
 - **`plan_release`** — compute effective payout and fee outputs without building PSBTs
 - **`sign_ark_tx`** / **`sign_checkpoint`** / **`sign_refresh`** — Schnorr signing helpers
 - **`merge_ark_tx_sigs`** — merge signatures from multiple parties
-- **`SpendStore`** trait — pluggable crash-recovery storage for the two-phase offchain spend protocol.
-  A record is written *before* `submit` and removed only after `finalize`, guarded by a per-attempt token
+- **`SpendStore`** trait — pluggable crash-recovery storage for the offchain spend protocol.
+  A record is written *before* `submit` and kept as `finalized` afterwards, guarded by a per-attempt token
 
 ### Example
 
@@ -255,7 +255,7 @@ records that are not finalized.
 
 Records written by gem versions before the co-signature check have no
 `server_signed_ark_tx`. If such a record is at `submitted` stage, resuming it
-fails closed rather than releasing checkpoint signatures without evidence.
+fails closed rather than finalizing without evidence.
 
 What this does and does not recover:
 
@@ -264,14 +264,19 @@ What this does and does not recover:
 - Crash or timeout before the server accepted `submit`: recoverable, the retry
   re-sends the same submit.
 - Timeout or crash after the server accepted `submit` but before its response
-  was read: **not** resolved by this gem yet. The retry fails with
-  "duplicated offchain tx" and the record stays at `submitting` with the ark
-  txid for operator follow-up. On a server with one-shot submit the spend is
-  then already finalized and only the local record is stale: confirm it with
-  the indexer (the ark tx's outputs exist) before acting on the record. On an
-  older server the transaction is pending, and recovering the server's
-  checkpoint signatures needs `GetPendingTx` with a proof signed by both escrow
-  parties.
+  was read, or a finalized record that could not be written: recoverable. The
+  retry is answered with "duplicated offchain tx"; the gem then reads the
+  co-signed ark tx and the server-signed checkpoints back from the indexer,
+  verifies them, and sends `finalize`, which is a no-op for a spend the server
+  finalized on submit and completes a pending one.
+- The same, against an indexer that does not serve the server's signatures (or
+  is unreachable): **not** recoverable by this gem. The call fails, the record
+  stays at `submitting` with the ark txid, and a later retry tries again.
+  Recovering without the indexer needs `GetPendingTx` with a proof signed by
+  both escrow parties.
+- An error after a one-shot submit does not mean the escrow is unspent: the
+  server may already have finalized. Retry with the same `id` before treating
+  a spend as failed.
 
 A custom store must:
 
