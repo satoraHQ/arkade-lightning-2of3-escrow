@@ -233,9 +233,11 @@ pub fn ark_tx_sighash(
 /// that key makes the leaf spendable. The signature must be a `Default`
 /// sighash Schnorr signature over input 0 of the same unsigned transaction.
 ///
-/// This is the client-side half of the protocol invariant: party checkpoint
-/// signatures are only released (via `finalize`) once the server has
-/// committed to the ark transaction that pays the parties out. Only the
+/// A spend is only recorded as submitted or finalized, and `finalize` is
+/// only sent to a server without one-shot submit, once the server has
+/// committed to the ark transaction that pays the parties out. With one-shot
+/// submit the party checkpoint signatures have already been sent by then, so
+/// this check no longer gates their release; it yields the evidence. Only the
 /// verified signature is taken from the server's response; everything else
 /// (party signatures, control blocks, witness data) comes from `local`.
 pub fn verify_server_ark_tx_sig(local: &Psbt, server_signed: &Psbt) -> Result<Psbt> {

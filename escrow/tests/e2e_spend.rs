@@ -60,6 +60,58 @@ async fn release_pays_the_buyer_destination() -> Result<()> {
     Ok(())
 }
 
+/// One-shot submit against the real server: checkpoints that go out with
+/// both party signatures come back still carrying them, which is arkd's
+/// way of saying it finalized within `SubmitTx` (v0.9.25+). The payout then
+/// arrives without any `FinalizeTx`. An older arkd drops the signatures; the
+/// test then finalizes separately, as the client's fallback does.
+#[tokio::test]
+#[ignore = "requires local arkade regtest stack"]
+async fn submit_with_signed_checkpoints_is_finalized_by_arkd() -> Result<()> {
+    let _guard = REGTEST_LOCK.lock().await;
+    let client = connect_escrow_client().await?;
+    let escrow = fund_escrow(&client).await?;
+    let destination = Parties::random().contract(&client)?;
+
+    let release = client
+        .build_release_for_outpoint(
+            &escrow.contract,
+            escrow.vtxo.outpoint,
+            &destination.address(),
+            &[],
+            SignerSet::BuyerArbiter,
+        )
+        .await?;
+    let signed = sign_spend(&release, &escrow.parties.buyer, &escrow.parties.arbiter)?;
+    let ark_txid = signed.merged_ark_tx.unsigned_tx.compute_txid();
+
+    let mut signed_checkpoints = signed.unsigned_checkpoints.clone();
+    for party in &signed.party_checkpoints {
+        for (checkpoint, party_checkpoint) in signed_checkpoints.iter_mut().zip(party) {
+            spend::merge_ark_tx_sigs(checkpoint, party_checkpoint)?;
+        }
+    }
+
+    let res = client
+        .grpc()
+        .submit_offchain_transaction_request(signed.merged_ark_tx.clone(), signed_checkpoints)
+        .await
+        .context("one-shot submit")?;
+    eprintln!("arkd finalized on submit: {}", res.finalized);
+    if !res.finalized {
+        client
+            .grpc()
+            .finalize_offchain_transaction(ark_txid, res.signed_checkpoint_txs)
+            .await
+            .context("finalize on an arkd without one-shot submit")?;
+    }
+
+    wait_for_exact_contract_amount(&client, &destination, ESCROW_AMOUNT)
+        .await
+        .context("released amount did not arrive at the buyer destination")?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires local arkade regtest stack"]
 async fn refund_pays_the_seller_destination() -> Result<()> {

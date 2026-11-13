@@ -24,8 +24,8 @@ pub struct RefreshServer {
     pub submit_requests: Arc<AtomicUsize>,
     /// Number of `FinalizeTx` requests received.
     pub finalize_requests: Arc<AtomicUsize>,
-    /// Total `tap_script_sigs` seen on checkpoints in `SubmitTx` requests.
-    /// Must stay 0: party checkpoint signatures never travel in submit.
+    /// Total `tap_script_sigs` seen on checkpoints in `SubmitTx` requests:
+    /// the party signatures, sent up front for one-shot submit.
     pub submitted_checkpoint_sigs: Arc<AtomicUsize>,
     /// Number of `RegisterIntent` requests received.
     pub register_requests: Arc<AtomicUsize>,
@@ -49,11 +49,16 @@ pub enum Behavior {
     /// `SubmitTx` never answers. The client cannot tell whether it was
     /// accepted.
     StallSubmit,
-    /// `SubmitTx` echoes the submitted PSBTs back as "signed"; `FinalizeTx`
-    /// never answers.
+    /// Like `AcceptSpend`, but `FinalizeTx` never answers.
     StallFinalize,
-    /// `SubmitTx` echoes the submitted PSBTs back; `FinalizeTx` succeeds.
+    /// An arkd without one-shot submit: `SubmitTx` co-signs the ark tx and
+    /// returns the checkpoints with the party signatures dropped;
+    /// `FinalizeTx` succeeds.
     AcceptSpend,
+    /// An arkd with one-shot submit: `SubmitTx` co-signs the ark tx and
+    /// returns the checkpoints still carrying the party signatures, which
+    /// means it finalized. `FinalizeTx` is not expected.
+    AcceptOneShot,
     /// `SubmitTx` answers with gRPC `InvalidArgument`.
     RejectSubmit,
     /// `SubmitTx` echoes the PSBTs back without co-signing the ark tx.
@@ -89,20 +94,32 @@ pub fn server_keypair() -> Keypair {
 }
 
 /// Co-sign input 0 of a base64 ark tx PSBT through the same ark-core signing
-/// path a real signer uses, and strip the party data a real server would not
-/// echo back.
+/// path a real signer uses. The party signatures stay on the PSBT, as arkd
+/// returns them: ark-grpc checks every signature of the spend leaf on the
+/// response.
 fn cosign_ark_tx(ark_tx_b64: &str, seed: u8) -> String {
     use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
     let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(ark_tx_b64).unwrap()).unwrap();
-    let party_sigs = std::mem::take(&mut psbt.inputs[0].tap_script_sigs);
+    let before = psbt.inputs[0].tap_script_sigs.len();
     ark_escrow::spend::sign_ark_tx(&mut psbt, &keypair(seed)).unwrap();
-    assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
-    assert!(
-        party_sigs
-            .keys()
-            .all(|k| !psbt.inputs[0].tap_script_sigs.contains_key(k))
-    );
+    assert_eq!(psbt.inputs[0].tap_script_sigs.len(), before + 1);
     STANDARD.encode(psbt.serialize())
+}
+
+/// The checkpoints as an arkd without one-shot submit returns them: party
+/// signatures dropped.
+fn strip_checkpoint_sigs(checkpoints: Vec<String>) -> Vec<String> {
+    use bitcoin::base64::{Engine, engine::general_purpose::STANDARD};
+    checkpoints
+        .into_iter()
+        .map(|b64| {
+            let mut psbt = bitcoin::Psbt::deserialize(&STANDARD.decode(b64).unwrap()).unwrap();
+            for input in &mut psbt.inputs {
+                input.tap_script_sigs.clear();
+            }
+            STANDARD.encode(psbt.serialize())
+        })
+        .collect()
 }
 
 /// Number of `tap_script_sigs` across all checkpoints in a `SubmitTx` request.
@@ -230,7 +247,10 @@ impl RefreshServer {
                                     SubmitTxResponse {
                                         ark_txid: String::new(),
                                         final_ark_tx,
-                                        signed_checkpoint_txs: req.checkpoint_txs,
+                                        signed_checkpoint_txs: match behavior {
+                                            Behavior::AcceptOneShot => req.checkpoint_txs,
+                                            _ => strip_checkpoint_sigs(req.checkpoint_txs),
+                                        },
                                     }
                                     .encode_to_vec()
                                 }

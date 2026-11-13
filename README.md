@@ -231,9 +231,15 @@ See [docs/protocol.md](docs/protocol.md) for the full PSBT exchange protocol.
 
 `spend_escrow_offchain` writes a `PendingSpend` record **before** the `submit`
 request leaves the process, rewrites it once the server's verified ark tx
-co-signature and checkpoint signatures are in hand, marks it `finalized` after
-`finalize` succeeds, and deletes it only if the server definitively rejects the
-submit. Calling it again with the same `id`, or calling
+co-signature and checkpoint signatures are in hand, marks it `finalized` once
+the server has finalized, and deletes it only if the server definitively
+rejects the submit. On arkd v0.9.25+ the spend is one request: the checkpoints
+are submitted fully party-signed and the server finalizes within `submit`
+(one-shot submit), so the record goes straight from `submitting` to
+`finalized`. An older server drops the signatures and gets a separate
+`finalize`; only then does a record pass through `submitted`. See
+[docs/protocol.md](docs/protocol.md) for what one-shot submit trusts the
+server with. Calling it again with the same `id`, or calling
 `resume_pending_spend(id)`, resumes from whatever stage was recorded; a
 finalized record returns its txid without a server call. While a record exists
 the supplied `merged_ark_tx` must be the recorded transaction (same txid) and
@@ -253,15 +259,19 @@ fails closed rather than releasing checkpoint signatures without evidence.
 
 What this does and does not recover:
 
-- Crash or failed `finalize` after `submit` returned: fully recoverable, the
-  retry only finalizes.
+- Crash or failed `finalize` after `submit` returned (servers without one-shot
+  submit only): fully recoverable, the retry only finalizes.
 - Crash or timeout before the server accepted `submit`: recoverable, the retry
   re-sends the same submit.
 - Timeout or crash after the server accepted `submit` but before its response
-  was read: **not** recoverable by this gem yet. The retry fails with
-  "inputs already locked" and the record stays at `submitting` with the ark txid
-  for operator follow-up. Recovering the server's checkpoint signatures needs
-  `GetPendingTx` with a proof signed by both escrow parties.
+  was read: **not** resolved by this gem yet. The retry fails with
+  "duplicated offchain tx" and the record stays at `submitting` with the ark
+  txid for operator follow-up. On a server with one-shot submit the spend is
+  then already finalized and only the local record is stale: confirm it with
+  the indexer (the ark tx's outputs exist) before acting on the record. On an
+  older server the transaction is pending, and recovering the server's
+  checkpoint signatures needs `GetPendingTx` with a proof signed by both escrow
+  parties.
 
 A custom store must:
 

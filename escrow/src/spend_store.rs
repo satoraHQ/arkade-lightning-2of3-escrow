@@ -1,16 +1,17 @@
 //! Persistence for pending offchain spends.
 //!
-//! An Arkade offchain spend is two server calls, `submit` then `finalize`.
-//! Once the server has accepted `submit` it locks the inputs until the spend
-//! is finalized, so a crash or lost response anywhere after the request left
-//! the process must be recoverable from local state. A retry that resubmits
+//! An Arkade offchain spend is one server call on arkd v0.9.25+ (one-shot
+//! `submit`, which also finalizes) and two on older servers, `submit` then
+//! `finalize`. Once the server has accepted `submit` the inputs are spent or
+//! locked, so a crash or lost response anywhere after the request left the
+//! process must be recoverable from local state. A retry that resubmits
 //! a *new* transaction for the same inputs fails with "inputs already locked".
 //!
 //! [`EscrowClient::spend_escrow_offchain`](crate::client::EscrowClient::spend_escrow_offchain)
 //! therefore records a [`PendingSpend`] *before* the first request leaves the
 //! process, upgrades it once the server's verified ark tx co-signature and
 //! checkpoint signatures are in hand, and marks it [`SpendStage::Finalized`]
-//! after `finalize` succeeds. Finalized records are kept, not removed: they
+//! once the server has finalized (on `submit`, or after `finalize`). Finalized records are kept, not removed: they
 //! are the parties' evidence of the server's commitment.
 //!
 //! [`SpendStore`] is the trait that backends implement. A file-based default
