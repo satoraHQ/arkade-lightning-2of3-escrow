@@ -12,7 +12,7 @@ clippy:
 test:
     cargo test --workspace
 
-ci: fmt-check clippy test
+ci: fmt-check clippy test test-ruby
 
 # Build the Ruby extension and the symlink `lib/ark_escrow.rb` loads.
 build-ruby:
@@ -23,6 +23,10 @@ build-ruby:
       Darwin) ln -sf libark_escrow_ruby.dylib target/debug/ark_escrow_ruby.bundle ;;
       *)      ln -sf libark_escrow_ruby.so target/debug/ark_escrow_ruby.so ;;
     esac
+
+# Ruby extension checks that need no arkd.
+test-ruby: build-ruby
+    ruby ruby-ext/test/gvl.rb
 
 # End-to-end tests against a running arkade-regtest stack. Defaults to the
 # `regtest` submodule; override REGTEST_DIR to point elsewhere.
