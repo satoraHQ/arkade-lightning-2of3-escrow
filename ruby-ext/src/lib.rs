@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::{c_int, c_void};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -12,10 +13,11 @@ use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::key::Keypair;
 use bitcoin::secp256k1::{self, Secp256k1};
 use bitcoin::{Amount, Network, OutPoint, Psbt, XOnlyPublicKey};
+use magnus::error::ErrorType;
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
-use magnus::value::Opaque;
-use magnus::{Error, Ruby, Value, function, method};
+use magnus::value::{BoxValue, Opaque};
+use magnus::{Error, Exception, Ruby, Value, function, method};
 use tokio::runtime::Runtime;
 
 // --- helpers ---
@@ -145,15 +147,17 @@ unsafe extern "C" fn gvl_trampoline<F: FnOnce() -> R, R>(data: *mut c_void) -> *
 /// No unblock function is passed, so `Thread#kill`, `Timeout` and friends
 /// cannot cut `f` short: it is bounded by the client timeouts, as it was
 /// while it held the GVL. Ruby delivers such an interrupt once `f` has
-/// returned; it comes back as `Err` and the result of `f` is dropped.
+/// returned; it comes back as `Err` and the result of `f` is dropped. An
+/// interrupt that is already pending is delivered before `f` runs at all.
 fn without_gvl<F: FnOnce() -> R, R>(f: F) -> Result<R, Error> {
     let mut call = GvlCall {
         f: Some(f),
         out: None,
     };
     let data: *mut c_void = (&raw mut call).cast();
-    // `rb_thread_call_without_gvl` checks interrupts after `f` and may raise;
-    // `protect` keeps that from unwinding through the Rust frames above.
+    // `rb_thread_call_without_gvl` checks interrupts before and after `f` and
+    // may raise; `protect` keeps that from unwinding through the Rust frames
+    // above.
     let interrupted = magnus::rb_sys::protect(|| unsafe {
         rb_sys::rb_thread_call_without_gvl(
             Some(gvl_trampoline::<F, R>),
@@ -163,12 +167,12 @@ fn without_gvl<F: FnOnce() -> R, R>(f: F) -> Result<R, Error> {
         );
         rb_sys::Qnil as rb_sys::VALUE
     });
-    let value = match call.out.take() {
-        Some(Ok(value)) => value,
+    match call.out.take() {
+        Some(Ok(value)) => interrupted.map(|_| value),
         Some(Err(panic)) => resume_unwind(panic),
-        None => unreachable!("Ruby runs the callback before checking interrupts"),
-    };
-    interrupted.map(|_| value)
+        // Raised by the check before `f`, which then never ran.
+        None => Err(interrupted.expect_err("Ruby skips the callback only to raise")),
+    }
 }
 
 /// Run `f` with the GVL held, taking it back if the caller is inside
@@ -192,6 +196,54 @@ fn with_gvl<F: FnOnce() -> R, R>(f: F) -> R {
 }
 
 // --- Callback-based SpendStore ---
+
+thread_local! {
+    /// An interrupt caught in a store callback, to raise once the call that
+    /// reached the store returns. Boxed so the GC keeps the exception alive
+    /// until then.
+    static STORE_INTERRUPT: RefCell<Option<StoreInterrupt>> = const { RefCell::new(None) };
+}
+
+enum StoreInterrupt {
+    Exception(BoxValue<Exception>),
+    Jump(Error),
+}
+
+/// Turn a failed store callback into the error the spend flow sees.
+///
+/// A `StandardError` is the store failing. Anything else (`Thread#kill`,
+/// `Timeout`, `throw`) is an interrupt that happened to land in the callback:
+/// the spend flow still sees a failed store call, and [`take_store_interrupt`]
+/// hands the original back to Ruby instead of a `RuntimeError` describing it.
+fn store_error(method: &str, error: Error) -> anyhow::Error {
+    let failure = anyhow::anyhow!("Ruby store#{method} failed: {error}");
+    let interrupt = match error.error_type() {
+        ErrorType::Exception(e) => {
+            let ruby = Ruby::get_with(*e);
+            (!e.is_kind_of(ruby.exception_standard_error()))
+                .then(|| StoreInterrupt::Exception(BoxValue::new(*e)))
+        }
+        ErrorType::Jump(_) => Some(StoreInterrupt::Jump(error)),
+        ErrorType::Error(..) => None,
+    };
+    if let Some(interrupt) = interrupt {
+        // The first one wins: later callbacks of the same call may fail too.
+        STORE_INTERRUPT.with(|slot| {
+            slot.borrow_mut().get_or_insert(interrupt);
+        });
+    }
+    failure
+}
+
+/// The interrupt a store callback caught on this thread, if any.
+fn take_store_interrupt() -> Option<Error> {
+    STORE_INTERRUPT
+        .with(|slot| slot.borrow_mut().take())
+        .map(|interrupt| match interrupt {
+            StoreInterrupt::Exception(e) => Error::from(*e),
+            StoreInterrupt::Jump(error) => error,
+        })
+}
 
 /// A [`SpendStore`] that delegates to a Ruby object responding to
 /// `save(id, json)`, `load(id) -> json|nil`, and `remove(id)`.
@@ -234,7 +286,7 @@ impl SpendStore for CallbackSpendStore {
             let json = serde_json::to_string(spend)?;
             let _: magnus::Value = store
                 .funcall("save", (spend.id.as_str(), json.as_str()))
-                .map_err(|e| anyhow::anyhow!("Ruby store#save failed: {e}"))?;
+                .map_err(|e| store_error("save", e))?;
             Ok(())
         })
     }
@@ -245,7 +297,7 @@ impl SpendStore for CallbackSpendStore {
             let store = ruby.get_inner(self.rb_store);
             let result: Option<String> = store
                 .funcall("load", (id,))
-                .map_err(|e| anyhow::anyhow!("Ruby store#load failed: {e}"))?;
+                .map_err(|e| store_error("load", e))?;
             match result {
                 Some(json) => Ok(Some(serde_json::from_str(&json)?)),
                 None => Ok(None),
@@ -259,7 +311,7 @@ impl SpendStore for CallbackSpendStore {
             let store = ruby.get_inner(self.rb_store);
             let _: magnus::Value = store
                 .funcall("remove", (id,))
-                .map_err(|e| anyhow::anyhow!("Ruby store#remove failed: {e}"))?;
+                .map_err(|e| store_error("remove", e))?;
             Ok(())
         })
     }
@@ -270,7 +322,7 @@ impl SpendStore for CallbackSpendStore {
             let store = ruby.get_inner(self.rb_store);
             let supported: bool = store
                 .funcall("respond_to?", ("remove_if",))
-                .map_err(|e| anyhow::anyhow!("Ruby store#respond_to? failed: {e}"))?;
+                .map_err(|e| store_error("respond_to?", e))?;
             if !supported {
                 // Non-atomic fallback: load, compare token, remove.
                 return match self.load(id)? {
@@ -283,7 +335,7 @@ impl SpendStore for CallbackSpendStore {
             }
             let removed: bool = store
                 .funcall("remove_if", (id, token))
-                .map_err(|e| anyhow::anyhow!("Ruby store#remove_if failed: {e}"))?;
+                .map_err(|e| store_error("remove_if", e))?;
             Ok(removed)
         })
     }
@@ -294,7 +346,7 @@ impl SpendStore for CallbackSpendStore {
             let store = ruby.get_inner(self.rb_store);
             let supported: bool = store
                 .funcall("respond_to?", ("save_if",))
-                .map_err(|e| anyhow::anyhow!("Ruby store#respond_to? failed: {e}"))?;
+                .map_err(|e| store_error("respond_to?", e))?;
             if !supported {
                 return match self.load(&spend.id)? {
                     Some(existing)
@@ -312,7 +364,7 @@ impl SpendStore for CallbackSpendStore {
                     "save_if",
                     (spend.id.as_str(), json.as_str(), spend.token.as_str()),
                 )
-                .map_err(|e| anyhow::anyhow!("Ruby store#save_if failed: {e}"))?;
+                .map_err(|e| store_error("save_if", e))?;
             Ok(written)
         })
     }
@@ -355,6 +407,20 @@ impl RbContract {
     fn address(&self) -> String {
         self.inner.address().to_string()
     }
+}
+
+/// Replace the client with its connected clone, keeping the settings as they
+/// are now: a setter may have run while the clone was connecting. Of two
+/// concurrent connects the later one wins; both hold a live connection.
+fn store_connected(
+    inner: &Mutex<EscrowClient>,
+    mut connected: EscrowClient,
+) -> Result<(), std::sync::PoisonError<std::sync::MutexGuard<'_, EscrowClient>>> {
+    let mut current = inner.lock()?;
+    connected.set_timeout(current.timeout());
+    connected.set_refresh_timeout(current.refresh_timeout());
+    *current = connected;
+    Ok(())
 }
 
 /// Ruby class: `ArkEscrow::Client`
@@ -506,8 +572,15 @@ impl RbClient {
 
     /// Drive `future` on the runtime with the GVL released, so other Ruby
     /// threads keep running while this one waits on the network.
+    ///
+    /// An interrupt caught in a store callback takes precedence over the
+    /// result, like one delivered when the GVL is taken back.
     fn block_on<F: Future>(&self, future: F) -> Result<F::Output, Error> {
-        without_gvl(|| self.rt.block_on(future))
+        let output = without_gvl(|| self.rt.block_on(future));
+        match take_store_interrupt() {
+            Some(interrupt) => Err(interrupt),
+            None => output,
+        }
     }
 
     fn connect(&self) -> Result<(), Error> {
@@ -516,8 +589,7 @@ impl RbClient {
         // the GVL held while this one waits for the GVL to return.
         let mut client = self.inner.lock().map_err(to_magnus_err)?.clone();
         self.block_on(client.connect())?.map_err(to_magnus_err)?;
-        *self.inner.lock().map_err(to_magnus_err)? = client;
-        Ok(())
+        store_connected(&self.inner, client).map_err(to_magnus_err)
     }
 
     fn server_pk(&self) -> Result<String, Error> {
@@ -648,7 +720,7 @@ impl RbClient {
         let pending_offchain = self
             .store
             .load(&id)
-            .map_err(to_magnus_err)?
+            .map_err(|e| take_store_interrupt().unwrap_or_else(|| to_magnus_err(e)))?
             .is_some_and(|p| p.stage != SpendStage::Finalized);
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let (vtxos, any_recoverable) = self
@@ -1323,4 +1395,26 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_module_function("sign_delegate", function!(rb_sign_delegate, 3))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connected_client_keeps_settings_changed_while_it_was_connecting() {
+        let inner = Mutex::new(EscrowClient::new("http://127.0.0.1:1"));
+        let connecting = inner.lock().unwrap().clone();
+
+        inner
+            .lock()
+            .unwrap()
+            .set_timeout(Some(Duration::from_millis(50)));
+        inner.lock().unwrap().set_refresh_timeout(None);
+        store_connected(&inner, connecting).unwrap();
+
+        let client = inner.lock().unwrap();
+        assert_eq!(client.timeout(), Some(Duration::from_millis(50)));
+        assert_eq!(client.refresh_timeout(), None);
+    }
 }

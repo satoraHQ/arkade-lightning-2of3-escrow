@@ -27,6 +27,7 @@ class Store
 
   def load(id)
     raise ArgumentError, "store is down" if id == "boom"
+    sleep 1 if id == "slow"
 
     @loaded << id
     nil
@@ -78,3 +79,43 @@ elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 check("an interrupt is delivered after the call returns (#{error}, #{elapsed.round(1)}s)") do
   error == Timeout::Error && elapsed >= TIMEOUT_MS / 1000.0
 end
+
+# An interrupt already pending when the call starts: Ruby raises it before
+# running the call at all. The mask keeps it pending until the call itself.
+pending = false
+interrupted = Thread.new do
+  Thread.handle_interrupt(ArgumentError => :never) do
+    nil until pending
+    Thread.handle_interrupt(ArgumentError => :immediate) { client.connect }
+  end
+end
+interrupted.report_on_exception = false
+interrupted.raise(ArgumentError, "raised before the call")
+pending = true
+error = begin
+  interrupted.value
+rescue Exception => e # rubocop:disable Lint/RescueException
+  e
+end
+check("a pending interrupt is delivered instead of the call (#{error.class})") do
+  error.is_a?(ArgumentError) && error.message == "raised before the call"
+end
+
+# An interrupt that lands while a store callback runs is not a store failure:
+# it reaches Ruby as itself once the call returns.
+error = begin
+  Timeout.timeout(0.1) { client.resume_pending_spend("slow") }
+rescue Timeout::Error, RuntimeError => e
+  e.class
+end
+check("a timeout inside a store callback stays a timeout (#{error})") { error == Timeout::Error }
+
+survived = false
+killed = Thread.new do
+  client.resume_pending_spend("slow")
+  survived = true
+end
+sleep 0.1
+killed.kill
+killed.join
+check("a thread killed inside a store callback dies") { !survived }
