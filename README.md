@@ -215,6 +215,28 @@ outpoint, amount = client.find_escrow_vtxo(contract)
 
 Legacy direct delegated methods remain for compatibility, but are deprecated.
 
+### Threads
+
+Calls that talk to arkd release Ruby's GVL while they wait, so other threads of
+the process keep running; one client can be shared and called from several
+threads at once. The spend-store callbacks run on the calling thread with the
+GVL held, like any other Ruby code.
+
+A call in progress cannot be interrupted: `Timeout` and `Thread#kill` take
+effect once it returns, and its return value is then lost. The same goes for
+an interrupt that lands inside a store callback. Rely on `timeout_ms` and
+`refresh_timeout_ms` to bound a call. What a lost return value costs depends
+on the call:
+
+- `spend_escrow_offchain`: the record is in the spend store before the submit
+  leaves, so `resume_pending_spend(id)`, or the same call again, returns the
+  txid.
+- `refresh_escrow`: nothing is stored and the commitment txid is gone. Query
+  the VTXOs again (`find_refresh_vtxos`) to see whether the refresh went
+  through.
+- Calls that only read or build (`find_*`, `build_*`, `prepare_refresh`):
+  call again.
+
 ### Rust logging
 
 The Ruby extension initialises a `tracing` subscriber on load. Control verbosity via `RUST_LOG`:
