@@ -702,16 +702,22 @@ impl RbClient {
     /// `amount_sats` is the amount the caller read for this VTXO from
     /// `find_escrow_vtxo_statuses`; verification fails unless the VTXO is worth exactly that.
     /// `l1_outputs` is `[[txid, vout, address, amount_sats], ...]`: outputs of the VTXO's
-    /// commitment transactions as read from Bitcoin, not from Arkade. Returns the txids of the
-    /// commitment transactions the VTXO stands on; the caller requires confirmations on those.
-    /// Raises when the VTXO cannot be traced to them.
+    /// commitment transactions as read from Bitcoin, not from Arkade. Raises when the VTXO cannot
+    /// be traced to them.
+    ///
+    /// Returns `[anchors, spends]`. `anchors` are the Bitcoin outputs (`"txid:vout"`) the VTXO
+    /// stands on; the caller requires confirmations on those. `spends` is
+    /// `[[outpoint, spender_txid], ...]` for every output on the VTXO's path, anchors included:
+    /// an output Bitcoin has seen spent must have been spent by `spender_txid`, or the VTXO has no
+    /// way out. While the anchors are unspent, nothing else on the path is on Bitcoin yet.
+    #[allow(clippy::type_complexity)]
     fn verify_escrow_vtxo(
         &self,
         contract: &RbContract,
         escrow_outpoint: String,
         amount_sats: u64,
         l1_outputs: Vec<(String, u32, String, u64)>,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<(Vec<String>, Vec<(String, String)>), Error> {
         let outpoint: OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let network = client.server_info().map_err(to_magnus_err)?.network;
@@ -734,7 +740,7 @@ impl RbClient {
             })
             .collect::<Result<HashMap<_, _>, Error>>()?;
 
-        let commitment_txids = self
+        let path = self
             .block_on(client.verify_escrow_vtxo(
                 &contract.inner,
                 outpoint,
@@ -743,7 +749,13 @@ impl RbClient {
             ))?
             .map_err(to_magnus_err)?;
 
-        Ok(commitment_txids.iter().map(ToString::to_string).collect())
+        Ok((
+            path.anchors.iter().map(ToString::to_string).collect(),
+            path.spends
+                .iter()
+                .map(|(outpoint, spender)| (outpoint.to_string(), spender.to_string()))
+                .collect(),
+        ))
     }
 
     /// Find all unspent escrow VTXOs and check recoverability.

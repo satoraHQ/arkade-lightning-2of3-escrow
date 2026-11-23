@@ -149,8 +149,15 @@ raise "oldest escrow VTXO is not spendable" unless oldest && oldest[4]
 l1_outputs = oldest[8].flat_map do |txid|
   bitcoin_tx(txid).outputs.each_with_index.map { |out, vout| [txid, vout, out.address, out.sats] }
 end
-commitment_txids = client.verify_escrow_vtxo(contract, oldest[0], oldest[1], l1_outputs) # raises if not backed
-raise "commitment not buried yet" unless commitment_txids.all? { |txid| bitcoin_tx(txid).confirmations >= 1 }
+anchors, spends = client.verify_escrow_vtxo(contract, oldest[0], oldest[1], l1_outputs) # raises if not backed
+raise "commitment not buried yet" unless anchors.all? { |outpoint| bitcoin_tx(outpoint.split(":").first).confirmations >= 1 }
+# The proof shows the exit path could be published, not that Bitcoin still has room for it. An
+# output on the path that Bitcoin has seen spent must have been spent by the path's own transaction.
+# While every anchor is unspent nothing further down is on Bitcoin, so checking the anchors is enough.
+spends.each do |outpoint, spender_txid|
+  spent_by = bitcoin_spender(outpoint) # nil while unspent, or not on Bitcoin at all
+  raise "escrow VTXO has lost its exit path" unless spent_by.nil? || spent_by == spender_txid
+end
 ark_tx_b64, checkpoint_b64s = client.build_release_for_outpoint(
   contract, oldest[0], buyer_dest_address, fee_outputs, "buyer_arbiter"
 )

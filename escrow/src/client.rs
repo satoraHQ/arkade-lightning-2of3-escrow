@@ -225,15 +225,15 @@ impl EscrowClient {
     /// `amount` is what the caller took the VTXO to be worth when it selected it. The listing is
     /// fetched again here, so only this argument ties the proof to the caller's decision.
     /// `l1_outputs` are outputs of the VTXO's commitment transactions, read from Bitcoin by the
-    /// caller. Returns the commitment transactions the VTXO's path starts from; the caller decides
-    /// how deep they must be.
+    /// caller. Returns where the VTXO's path meets Bitcoin; the caller checks those outputs are
+    /// buried deep enough and still there, see [`verify::ExitPath`].
     pub async fn verify_escrow_vtxo(
         &self,
         contract: &EscrowContract,
         outpoint: OutPoint,
         amount: bitcoin::Amount,
         l1_outputs: &HashMap<OutPoint, TxOut>,
-    ) -> Result<Vec<Txid>> {
+    ) -> Result<verify::ExitPath> {
         let (info, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
         let vtxo = vtxo_list
             .all_unspent()
