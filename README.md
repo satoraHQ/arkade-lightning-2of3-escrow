@@ -149,7 +149,7 @@ raise "oldest escrow VTXO is not spendable" unless oldest && oldest[4]
 l1_outputs = oldest[8].flat_map do |txid|
   bitcoin_tx(txid).outputs.each_with_index.map { |out, vout| [txid, vout, out.address, out.sats] }
 end
-commitment_txids = client.verify_escrow_vtxo(contract, oldest[0], l1_outputs) # raises if not backed
+commitment_txids = client.verify_escrow_vtxo(contract, oldest[0], oldest[1], l1_outputs) # raises if not backed
 raise "commitment not buried yet" unless commitment_txids.all? { |txid| bitcoin_tx(txid).confirmations >= 1 }
 ark_tx_b64, checkpoint_b64s = client.build_release_for_outpoint(
   contract, oldest[0], buyer_dest_address, fee_outputs, "buyer_arbiter"

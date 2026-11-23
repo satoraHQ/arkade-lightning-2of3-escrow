@@ -699,6 +699,8 @@ impl RbClient {
     /// Check that the escrow VTXO at `escrow_outpoint` descends, through signed virtual
     /// transactions, from outputs Bitcoin has.
     ///
+    /// `amount_sats` is the amount the caller read for this VTXO from
+    /// `find_escrow_vtxo_statuses`; verification fails unless the VTXO is worth exactly that.
     /// `l1_outputs` is `[[txid, vout, address, amount_sats], ...]`: outputs of the VTXO's
     /// commitment transactions as read from Bitcoin, not from Arkade. Returns the txids of the
     /// commitment transactions the VTXO stands on; the caller requires confirmations on those.
@@ -707,6 +709,7 @@ impl RbClient {
         &self,
         contract: &RbContract,
         escrow_outpoint: String,
+        amount_sats: u64,
         l1_outputs: Vec<(String, u32, String, u64)>,
     ) -> Result<Vec<String>, Error> {
         let outpoint: OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
@@ -732,7 +735,12 @@ impl RbClient {
             .collect::<Result<HashMap<_, _>, Error>>()?;
 
         let commitment_txids = self
-            .block_on(client.verify_escrow_vtxo(&contract.inner, outpoint, &l1_outputs))?
+            .block_on(client.verify_escrow_vtxo(
+                &contract.inner,
+                outpoint,
+                Amount::from_sat(amount_sats),
+                &l1_outputs,
+            ))?
             .map_err(to_magnus_err)?;
 
         Ok(commitment_txids.iter().map(ToString::to_string).collect())
@@ -1429,7 +1437,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method(
         "verify_escrow_vtxo",
-        method!(RbClient::verify_escrow_vtxo, 3),
+        method!(RbClient::verify_escrow_vtxo, 4),
     )?;
     client_class.define_method(
         "find_refresh_vtxos",

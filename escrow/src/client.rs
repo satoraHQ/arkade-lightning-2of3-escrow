@@ -222,6 +222,8 @@ impl EscrowClient {
     /// Check that the escrow VTXO at `outpoint` is backed by Bitcoin rather than by the indexer's
     /// word, see [`crate::verify`].
     ///
+    /// `amount` is what the caller took the VTXO to be worth when it selected it. The listing is
+    /// fetched again here, so only this argument ties the proof to the caller's decision.
     /// `l1_outputs` are outputs of the VTXO's commitment transactions, read from Bitcoin by the
     /// caller. Returns the commitment transactions the VTXO's path starts from; the caller decides
     /// how deep they must be.
@@ -229,6 +231,7 @@ impl EscrowClient {
         &self,
         contract: &EscrowContract,
         outpoint: OutPoint,
+        amount: bitcoin::Amount,
         l1_outputs: &HashMap<OutPoint, TxOut>,
     ) -> Result<Vec<Txid>> {
         let (info, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
@@ -254,7 +257,7 @@ impl EscrowClient {
         verify::verify_vtxo_chain(
             outpoint,
             &vtxo.script,
-            vtxo.amount,
+            amount,
             &chains,
             &virtual_txs,
             l1_outputs,

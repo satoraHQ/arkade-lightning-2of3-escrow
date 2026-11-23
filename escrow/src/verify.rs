@@ -88,7 +88,7 @@ pub fn verify_vtxo_chain(
     );
     ensure!(
         leaf_output.value == amount,
-        "VTXO output {outpoint} is worth {}, not the reported {amount}",
+        "VTXO output {outpoint} is worth {}, not the expected {amount}",
         leaf_output.value
     );
 
@@ -500,7 +500,7 @@ mod tests {
             &fixture.operator_keys(),
         );
 
-        assert_rejected(result, "not the reported");
+        assert_rejected(result, "not the expected");
     }
 
     #[test]
