@@ -10,6 +10,7 @@ use ark_escrow::client::EscrowClient;
 use ark_escrow::contract::{EscrowContract, EscrowOptions, SignerSet};
 use ark_escrow::refresh::{RefreshIntent, RefreshVtxo};
 use ark_escrow::spend_store::{FileSpendStore, PendingSpend, SpendStage, SpendStore};
+use ark_escrow::verify::{BitcoinView, L1Output};
 use ark_escrow::{FeeOutput, ReleaseMode, plan_release, spend};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::key::Keypair;
@@ -701,30 +702,36 @@ impl RbClient {
     ///
     /// `amount_sats` is the amount the caller read for this VTXO from
     /// `find_escrow_vtxo_statuses`; verification fails unless the VTXO is worth exactly that.
-    /// `l1_outputs` is `[[txid, vout, address, amount_sats], ...]`: outputs of the VTXO's
-    /// commitment transactions as read from Bitcoin, not from Arkade. Raises when the VTXO cannot
-    /// be traced to them.
+    /// `l1_outputs` is `[[txid, vout, address, amount_sats, spent_by], ...]`: outputs of the
+    /// VTXO's commitment transactions as read from Bitcoin, not from Arkade, `spent_by` being the
+    /// txid of the confirmed transaction spending the output, or nil while it is unspent.
+    /// `height` and `median_time_past` are those of the Bitcoin chain tip.
+    ///
+    /// Raises when the VTXO cannot be traced to those outputs, when Bitcoin would not take a
+    /// transaction of its path now, or when an output the path needs was spent by anything but
+    /// the path itself. Once a transaction of the path is on Bitcoin, its outputs have to be
+    /// passed in as well; the error names the ones missing.
     ///
     /// Returns `[anchors, spends]`. `anchors` are the Bitcoin outputs (`"txid:vout"`) the VTXO
     /// stands on; the caller requires confirmations on those. `spends` is
-    /// `[[outpoint, spender_txid], ...]` for every output on the VTXO's path, anchors included:
-    /// an output Bitcoin has seen spent must have been spent by `spender_txid`, or the VTXO has no
-    /// way out. While the anchors are unspent, nothing else on the path is on Bitcoin yet.
+    /// `[[outpoint, spender_txid], ...]` for every output on the VTXO's path, anchors included.
     #[allow(clippy::type_complexity)]
     fn verify_escrow_vtxo(
         &self,
         contract: &RbContract,
         escrow_outpoint: String,
         amount_sats: u64,
-        l1_outputs: Vec<(String, u32, String, u64)>,
+        l1_outputs: Vec<(String, u32, String, u64, Option<String>)>,
+        height: u32,
+        median_time_past: u32,
     ) -> Result<(Vec<String>, Vec<(String, String)>), Error> {
         let outpoint: OutPoint = escrow_outpoint.parse().map_err(to_magnus_err)?;
         let client = self.inner.lock().map_err(to_magnus_err)?.clone();
         let network = client.server_info().map_err(to_magnus_err)?.network;
 
-        let l1_outputs = l1_outputs
+        let outputs = l1_outputs
             .into_iter()
-            .map(|(txid, vout, address, amount_sats)| {
+            .map(|(txid, vout, address, amount_sats, spent_by)| {
                 let txid: Txid = txid.parse().map_err(to_magnus_err)?;
                 let script_pubkey = address
                     .parse::<Address<NetworkUnchecked>>()
@@ -736,7 +743,11 @@ impl RbClient {
                     value: Amount::from_sat(amount_sats),
                     script_pubkey,
                 };
-                Ok((OutPoint::new(txid, vout), txout))
+                let spent_by = spent_by
+                    .map(|txid| txid.parse::<Txid>())
+                    .transpose()
+                    .map_err(to_magnus_err)?;
+                Ok((OutPoint::new(txid, vout), L1Output { txout, spent_by }))
             })
             .collect::<Result<HashMap<_, _>, Error>>()?;
 
@@ -745,7 +756,11 @@ impl RbClient {
                 &contract.inner,
                 outpoint,
                 Amount::from_sat(amount_sats),
-                &l1_outputs,
+                &BitcoinView {
+                    outputs,
+                    height,
+                    median_time_past,
+                },
             ))?
             .map_err(to_magnus_err)?;
 
@@ -1449,7 +1464,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     client_class.define_method(
         "verify_escrow_vtxo",
-        method!(RbClient::verify_escrow_vtxo, 4),
+        method!(RbClient::verify_escrow_vtxo, 6),
     )?;
     client_class.define_method(
         "find_refresh_vtxos",
