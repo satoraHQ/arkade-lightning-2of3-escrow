@@ -27,7 +27,7 @@ use bitcoin::opcodes::all::{
 use bitcoin::script::Instruction;
 use bitcoin::secp256k1::{Message, Secp256k1, Verification};
 use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::taproot::TapLeafHash;
+use bitcoin::taproot::{LeafVersion, TapLeafHash};
 use bitcoin::{
     Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxOut, Txid, XOnlyPublicKey, psbt,
 };
@@ -171,8 +171,11 @@ pub fn verify_vtxo_chain(
 
         // A signature commits to the amounts it spends, but nothing stops a signed transaction
         // from paying out more than it has; Bitcoin would reject it, so this does too.
-        let spent: Amount = prevouts.iter().map(|o| o.value).sum();
-        let paid: Amount = psbt.unsigned_tx.output.iter().map(|o| o.value).sum();
+        let spent = total_value(&prevouts).with_context(|| {
+            format!("virtual transaction {txid} spends more than can be counted")
+        })?;
+        let paid = total_value(&psbt.unsigned_tx.output)
+            .with_context(|| format!("virtual transaction {txid} pays more than can be counted"))?;
         ensure!(
             paid <= spent,
             "virtual transaction {txid} has outputs worth {paid} but spends only {spent}"
@@ -193,6 +196,14 @@ pub fn verify_vtxo_chain(
     anchors.dedup();
 
     Ok(ExitPath { anchors, spends })
+}
+
+/// The sum of the outputs' values, `None` if it does not fit: a sum that wrapped around would let
+/// a transaction pay out more than it spends.
+fn total_value(outputs: &[TxOut]) -> Option<Amount> {
+    outputs
+        .iter()
+        .try_fold(Amount::ZERO, |sum, output| sum.checked_add(output.value))
 }
 
 /// A transaction Bitcoin would not take yet is not a way out yet, whatever it is signed with.
@@ -296,6 +307,14 @@ fn verify_input<C: Verification>(
     // operator. The leaf has to be committed to, name the operator, carry a signature for every
     // CHECKSIG key, and have whatever else it asks for met by this transaction.
     for (control_block, (leaf_script, leaf_version)) in &input.tap_scripts {
+        // Bitcoin runs the script of a tapscript leaf only. A leaf of any other version is spent
+        // without it, by anyone, so what such a leaf says or is signed with protects nothing.
+        if *leaf_version != LeafVersion::TapScript
+            || control_block.leaf_version != LeafVersion::TapScript
+        {
+            continue;
+        }
+
         let pubkeys = ark_core::script::extract_checksig_pubkeys(leaf_script);
         if !pubkeys.iter().any(|pk| operator_keys.contains(pk))
             || !control_block.verify_taproot_commitment(secp, output_key, leaf_script)
@@ -450,7 +469,7 @@ mod tests {
     use bitcoin::script::Builder;
     use bitcoin::secp256k1::All;
     use bitcoin::sighash::TapSighashType;
-    use bitcoin::taproot::{self, LeafVersion, TaprootBuilder, TaprootSpendInfo};
+    use bitcoin::taproot::{self, TaprootBuilder, TaprootSpendInfo};
     use bitcoin::transaction::Version;
 
     const VALUE: Amount = Amount::from_sat(10_000);
@@ -484,24 +503,25 @@ mod tests {
         escrow_script: ScriptBuf,
         /// The tapleaf the Ark transaction spends the VTXO through.
         leaf: ScriptBuf,
+        leaf_version: LeafVersion,
     }
 
     impl Fixture {
         fn new() -> Self {
-            Self::spending_through(|owner, operator| {
-                Builder::new()
-                    .push_x_only_key(&owner)
-                    .push_opcode(OP_CHECKSIGVERIFY)
-                    .push_x_only_key(&operator)
-                    .push_opcode(OP_CHECKSIG)
-                    .into_script()
-            })
+            Self::spending_through(conditional_leaf(Builder::new()))
         }
 
         /// A deposit whose VTXO is spent through the leaf `leaf` builds from the owner's and the
         /// operator's keys.
         fn spending_through(
             leaf: impl FnOnce(XOnlyPublicKey, XOnlyPublicKey) -> ScriptBuf,
+        ) -> Self {
+            Self::with_leaf(leaf, LeafVersion::TapScript)
+        }
+
+        fn with_leaf(
+            leaf: impl FnOnce(XOnlyPublicKey, XOnlyPublicKey) -> ScriptBuf,
+            leaf_version: LeafVersion,
         ) -> Self {
             let secp = Secp256k1::new();
             let [cosigner, owner, operator, escrow] =
@@ -515,7 +535,7 @@ mod tests {
             let escrow_script = ScriptBuf::new_p2tr(&secp, escrow.x_only_public_key().0, None);
 
             let leaf = leaf(owner.x_only_public_key().0, operator.x_only_public_key().0);
-            let vtxo_info = leaf_info(&secp, &owner, &leaf);
+            let vtxo_info = leaf_info(&secp, &owner, &leaf, leaf_version);
             let vtxo_output = TxOut {
                 value: VALUE,
                 script_pubkey: ScriptBuf::new_p2tr_tweaked(vtxo_info.output_key()),
@@ -538,6 +558,7 @@ mod tests {
                 ark,
                 escrow_script,
                 leaf,
+                leaf_version,
             };
             fixture.sign_tree(&cosigner);
             fixture.sign_ark(&owner);
@@ -570,11 +591,10 @@ mod tests {
         /// the signature filed under the owner's key.
         fn sign_ark(&mut self, owner_signer: &Keypair) {
             let script = self.leaf.clone();
-            let info = leaf_info(&self.secp, &self.owner, &script);
-            let control_block = info
-                .control_block(&(script.clone(), LeafVersion::TapScript))
-                .unwrap();
-            let leaf_hash = TapLeafHash::from_script(&script, LeafVersion::TapScript);
+            let version = self.leaf_version;
+            let info = leaf_info(&self.secp, &self.owner, &script, version);
+            let control_block = info.control_block(&(script.clone(), version)).unwrap();
+            let leaf_hash = TapLeafHash::from_script(&script, version);
             let prevouts = [self.tree.unsigned_tx.output[0].clone()];
             let sighash = SighashCache::new(&self.ark.unsigned_tx)
                 .taproot_script_spend_signature_hash(
@@ -590,9 +610,7 @@ mod tests {
             let operator_sig = self.signature(sighash, &self.operator);
             let input = &mut self.ark.inputs[0];
             input.tap_script_sigs.clear();
-            input
-                .tap_scripts
-                .insert(control_block, (script, LeafVersion::TapScript));
+            input.tap_scripts.insert(control_block, (script, version));
             input
                 .tap_script_sigs
                 .insert((self.owner.x_only_public_key().0, leaf_hash), owner_sig);
@@ -691,13 +709,18 @@ mod tests {
             .push_x_only_key(&operator.x_only_public_key().0)
             .push_opcode(OP_CHECKSIG)
             .into_script();
-        let info = leaf_info(secp, owner, &script);
+        let info = leaf_info(secp, owner, &script, LeafVersion::TapScript);
         (script, info)
     }
 
-    fn leaf_info(secp: &Secp256k1<All>, owner: &Keypair, script: &ScriptBuf) -> TaprootSpendInfo {
+    fn leaf_info(
+        secp: &Secp256k1<All>,
+        owner: &Keypair,
+        script: &ScriptBuf,
+        version: LeafVersion,
+    ) -> TaprootSpendInfo {
         TaprootBuilder::new()
-            .add_leaf(0, script.clone())
+            .add_leaf_with_ver(0, script.clone(), version)
             .unwrap()
             .finalize(secp, owner.x_only_public_key().0)
             .unwrap()
@@ -877,6 +900,42 @@ mod tests {
         fixture.ark.inputs.push(signed);
 
         assert_rejected(fixture.verify(), "already spends");
+    }
+
+    #[test]
+    fn rejects_outputs_whose_sum_wraps_around() {
+        let mut fixture = Fixture::new();
+        let claimed = VALUE * 1000;
+        fixture.ark.unsigned_tx.output[0].value = claimed;
+        // Added to the escrow output with wrapping arithmetic, this comes to exactly `VALUE`.
+        let filler = TxOut {
+            value: Amount::from_sat(VALUE.to_sat().wrapping_sub(claimed.to_sat())),
+            script_pubkey: fixture.escrow_script.clone(),
+        };
+        fixture.ark.unsigned_tx.output.push(filler);
+        fixture.ark.outputs.push(Default::default());
+        let owner = fixture.owner;
+        fixture.sign_ark(&owner);
+
+        let result = fixture.verify_vtxo(
+            &fixture.escrow_script,
+            claimed,
+            &fixture.txs(),
+            &fixture.l1_outputs(),
+            &fixture.operator_keys(),
+        );
+
+        assert_rejected(result, "pays more than can be counted");
+    }
+
+    #[test]
+    fn rejects_a_leaf_of_a_version_bitcoin_does_not_run() {
+        let fixture = Fixture::with_leaf(
+            conditional_leaf(Builder::new()),
+            LeafVersion::from_consensus(0xc2).unwrap(),
+        );
+
+        assert_rejected(fixture.verify(), "no tapleaf");
     }
 
     #[test]
