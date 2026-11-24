@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -8,7 +7,7 @@ use ark_core::VtxoList;
 use ark_core::batch::Delegate;
 use ark_core::server::{self, GetVtxosRequest};
 use bitcoin::key::Keypair;
-use bitcoin::{OutPoint, Psbt, ScriptBuf, TxOut, Txid, XOnlyPublicKey};
+use bitcoin::{OutPoint, Psbt, ScriptBuf, Txid, XOnlyPublicKey};
 use rand::rngs::OsRng;
 
 use crate::FeeOutput;
@@ -222,15 +221,18 @@ impl EscrowClient {
     /// Check that the escrow VTXO at `outpoint` is backed by Bitcoin rather than by the indexer's
     /// word, see [`crate::verify`].
     ///
-    /// `l1_outputs` are outputs of the VTXO's commitment transactions, read from Bitcoin by the
-    /// caller. Returns the commitment transactions the VTXO's path starts from; the caller decides
-    /// how deep they must be.
+    /// `amount` is what the caller took the VTXO to be worth when it selected it. The listing is
+    /// fetched again here, so only this argument ties the proof to the caller's decision.
+    /// `bitcoin` is what the caller read from Bitcoin, see [`verify::BitcoinView`]. Returns where
+    /// the VTXO's path meets Bitcoin; the caller decides how deep those outputs must be buried,
+    /// see [`verify::ExitPath`].
     pub async fn verify_escrow_vtxo(
         &self,
         contract: &EscrowContract,
         outpoint: OutPoint,
-        l1_outputs: &HashMap<OutPoint, TxOut>,
-    ) -> Result<Vec<Txid>> {
+        amount: bitcoin::Amount,
+        bitcoin: &verify::BitcoinView,
+    ) -> Result<verify::ExitPath> {
         let (info, _, vtxo_list) = self.list_candidate_vtxos(contract).await?;
         let vtxo = vtxo_list
             .all_unspent()
@@ -254,10 +256,10 @@ impl EscrowClient {
         verify::verify_vtxo_chain(
             outpoint,
             &vtxo.script,
-            vtxo.amount,
+            amount,
             &chains,
             &virtual_txs,
-            l1_outputs,
+            bitcoin,
             &operator_keys,
         )
     }

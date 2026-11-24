@@ -145,12 +145,19 @@ oldest = client.find_escrow_vtxo_statuses(contract).min_by { |v| v[2] }
 raise "oldest escrow VTXO is not spendable" unless oldest && oldest[4]
 
 # The list is Arkade's word. Before treating the escrow as funded, check the VTXO against Bitcoin:
-# read the commitment transactions from your own Bitcoin source and pass their outputs in.
+# read the commitment transactions from your own Bitcoin source and pass their outputs in, each
+# with the txid of the confirmed transaction that spent it (nil while unspent), along with the
+# height and median time past of the chain tip. It raises if the VTXO is not backed: not traced
+# to those outputs, not publishable yet, or standing on an output something else has spent.
 l1_outputs = oldest[8].flat_map do |txid|
-  bitcoin_tx(txid).outputs.each_with_index.map { |out, vout| [txid, vout, out.address, out.sats] }
+  bitcoin_tx(txid).outputs.each_with_index.map do |out, vout|
+    [txid, vout, out.address, out.sats, out.spent_by]
+  end
 end
-commitment_txids = client.verify_escrow_vtxo(contract, oldest[0], l1_outputs) # raises if not backed
-raise "commitment not buried yet" unless commitment_txids.all? { |txid| bitcoin_tx(txid).confirmations >= 1 }
+anchors, _spends = client.verify_escrow_vtxo(
+  contract, oldest[0], oldest[1], l1_outputs, bitcoin_tip.height, bitcoin_tip.median_time_past
+)
+raise "commitment not buried yet" unless anchors.all? { |outpoint| bitcoin_tx(outpoint.split(":").first).confirmations >= 1 }
 ark_tx_b64, checkpoint_b64s = client.build_release_for_outpoint(
   contract, oldest[0], buyer_dest_address, fee_outputs, "buyer_arbiter"
 )

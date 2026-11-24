@@ -7,43 +7,90 @@
 //! transaction the owner could publish, so if each one is signed, spends its parent and ends in
 //! an output paying the escrow, the VTXO is as real as the commitment output it starts from.
 //!
-//! The commitment outputs themselves come from the caller, read from Bitcoin rather than from the
-//! indexer. The caller still has to decide how many confirmations those commitment transactions
-//! need; this module only says which ones the VTXO stands on.
+//! What Bitcoin holds comes from the caller, read from Bitcoin rather than from the indexer, see
+//! [`BitcoinView`]: the commitment outputs, who has spent them, and how far the chain has got. A
+//! path that is signed but that Bitcoin would not take now, because an output on it went to another
+//! transaction or a timelock has not run out, backs nothing. How deep the commitment transactions
+//! must be buried stays the caller's decision, see [`ExitPath`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
+use ark_core::VTXO_CONDITION_KEY;
 use ark_core::server::VtxoChains;
-use bitcoin::hashes::Hash;
+use bitcoin::absolute::LockTime;
+use bitcoin::hashes::{Hash, hash160};
+use bitcoin::opcodes::all::{
+    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CLTV, OP_DROP, OP_EQUAL, OP_EQUALVERIFY, OP_HASH160,
+    OP_VERIFY,
+};
+use bitcoin::script::Instruction;
 use bitcoin::secp256k1::{Message, Secp256k1, Verification};
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::taproot::TapLeafHash;
-use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, TxOut, Txid, XOnlyPublicKey};
+use bitcoin::{
+    Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxOut, Txid, XOnlyPublicKey, psbt,
+};
 
 /// More virtual transactions than any escrow deposit path has; bounds what the indexer can make
 /// us walk.
 pub const MAX_CHAIN_LEN: usize = 1_000;
 
+/// Bitcoin's limit on a witness stack element in a tapscript spend.
+const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+
+/// An output as the caller's Bitcoin node has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1Output {
+    pub txout: TxOut,
+    /// The confirmed transaction spending this output, `None` while it is unspent.
+    pub spent_by: Option<Txid>,
+}
+
+/// What the caller read from Bitcoin, the only part of a proof the indexer has no say in.
+#[derive(Debug, Clone, Default)]
+pub struct BitcoinView {
+    /// Outputs of the VTXO's commitment transactions. Once a transaction of the VTXO's path is
+    /// itself on Bitcoin, also the outputs of that transaction the path spends; verification
+    /// names the ones it is missing.
+    pub outputs: HashMap<OutPoint, L1Output>,
+    /// Height of the chain tip.
+    pub height: u32,
+    /// Median time past of the chain tip, which is what Bitcoin holds time locks against.
+    pub median_time_past: u32,
+}
+
+/// Where a verified VTXO's exit path meets Bitcoin.
+///
+/// The caller requires every anchor to be confirmed as deep as it sees fit. `spends` is what to
+/// read from Bitcoin next time: the outputs whose spending decides whether the path stays open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitPath {
+    /// The Bitcoin outputs the path starts from, in commitment transactions.
+    pub anchors: Vec<OutPoint>,
+    /// Each output the path spends, anchors included, with the path transaction spending it.
+    pub spends: Vec<(OutPoint, Txid)>,
+}
+
 /// Check that the VTXO at `outpoint`, paying `amount` to `script`, descends from Bitcoin outputs.
 ///
 /// `chains` and `virtual_txs` are the indexer's `GetVtxoChain` and `GetVirtualTxs` answers for the
-/// VTXO. `l1_outputs` are outputs of the commitment transactions as Bitcoin knows them.
+/// VTXO. `bitcoin` is what the caller read from Bitcoin.
 /// `operator_keys` are the Arkade signer keys, current and deprecated: every VTXO spend on the
 /// path must be cosigned by one of them, as an offchain spend always is. Without that, the owner
 /// of a real VTXO could present a spend of it through the exit leaf alone and keep the VTXO.
 ///
-/// Returns the commitment transactions the VTXO's path starts from, so the caller can require
-/// confirmations on exactly those.
+/// Returns the path's footing on Bitcoin, so the caller can require confirmations on exactly
+/// those.
 pub fn verify_vtxo_chain(
     outpoint: OutPoint,
     script: &ScriptBuf,
     amount: Amount,
     chains: &VtxoChains,
     virtual_txs: &[Psbt],
-    l1_outputs: &HashMap<OutPoint, TxOut>,
+    bitcoin: &BitcoinView,
     operator_keys: &[XOnlyPublicKey],
-) -> Result<Vec<Txid>> {
+) -> Result<ExitPath> {
     // The path is walked recursively, so its length is bounded before the indexer can make it
     // arbitrarily deep.
     ensure!(
@@ -88,12 +135,13 @@ pub fn verify_vtxo_chain(
     );
     ensure!(
         leaf_output.value == amount,
-        "VTXO output {outpoint} is worth {}, not the reported {amount}",
+        "VTXO output {outpoint} is worth {}, not the expected {amount}",
         leaf_output.value
     );
 
     let secp = Secp256k1::verification_only();
     let mut anchors = Vec::new();
+    let mut spends = Vec::new();
 
     for txid in &branch {
         let psbt = branch_txs[txid];
@@ -101,11 +149,12 @@ pub fn verify_vtxo_chain(
 
         for input in &psbt.unsigned_tx.input {
             let spent = input.previous_output;
+            spends.push((spent, *txid));
             let prevout = match branch_txs.get(&spent.txid) {
                 Some(parent) => parent.unsigned_tx.output.get(spent.vout as usize).cloned(),
                 None => {
-                    anchors.push(spent.txid);
-                    l1_outputs.get(&spent).cloned()
+                    anchors.push(spent);
+                    bitcoin.outputs.get(&spent).map(|o| o.txout.clone())
                 }
             };
             prevouts.push(prevout.with_context(|| {
@@ -126,12 +175,86 @@ pub fn verify_vtxo_chain(
             verify_input(&secp, psbt, index, &prevouts, operator_keys)
                 .with_context(|| format!("input {index} of virtual transaction {txid}"))?;
         }
+
+        verify_publishable_now(&psbt.unsigned_tx, bitcoin)
+            .with_context(|| format!("virtual transaction {txid}"))?;
     }
+
+    verify_path_still_open(outpoint, &spends, bitcoin)?;
 
     anchors.sort();
     anchors.dedup();
 
-    Ok(anchors)
+    Ok(ExitPath { anchors, spends })
+}
+
+/// A transaction Bitcoin would not take yet is not a way out yet, whatever it is signed with.
+fn verify_publishable_now(tx: &Transaction, bitcoin: &BitcoinView) -> Result<()> {
+    // Honest path transactions never wait on their parent's age; one that does could be held
+    // back until the batch has expired.
+    ensure!(
+        tx.input.iter().all(|i| !i.sequence.is_relative_lock_time()),
+        "waits on a relative timelock"
+    );
+
+    let reached = match tx.lock_time {
+        _ if !tx.is_lock_time_enabled() => true,
+        LockTime::Blocks(height) => height.to_consensus_u32() <= bitcoin.height,
+        LockTime::Seconds(time) => time.to_consensus_u32() < bitcoin.median_time_past,
+    };
+    ensure!(
+        reached,
+        "cannot be published before {}, and Bitcoin is at height {} and time {}",
+        tx.lock_time,
+        bitcoin.height,
+        bitcoin.median_time_past
+    );
+
+    Ok(())
+}
+
+/// Check that nothing on Bitcoin has taken an output the path needs.
+///
+/// An output of the path may be spent only by the path's own transaction. Such a spend puts
+/// that transaction on Bitcoin, and then its outputs are Bitcoin outputs too: what became of them
+/// has to be known, down to the VTXO itself.
+fn verify_path_still_open(
+    vtxo: OutPoint,
+    spends: &[(OutPoint, Txid)],
+    bitcoin: &BitcoinView,
+) -> Result<()> {
+    let mut on_bitcoin = HashSet::new();
+
+    for (spent, spender) in spends {
+        match bitcoin.outputs.get(spent).and_then(|o| o.spent_by) {
+            Some(by) if by == *spender => {
+                on_bitcoin.insert(*spender);
+            }
+            Some(by) => bail!(
+                "{spent} was spent on Bitcoin by {by}, not by {spender}: the VTXO has no exit path"
+            ),
+            None => {}
+        }
+    }
+
+    let produced_on_bitcoin = spends
+        .iter()
+        .map(|(spent, _)| *spent)
+        .chain([vtxo])
+        .filter(|output| on_bitcoin.contains(&output.txid));
+    for output in produced_on_bitcoin {
+        ensure!(
+            bitcoin.outputs.contains_key(&output),
+            "{} is on Bitcoin, so what Bitcoin has for its output {output} is needed",
+            output.txid
+        );
+    }
+
+    if let Some(by) = bitcoin.outputs.get(&vtxo).and_then(|o| o.spent_by) {
+        bail!("VTXO {vtxo} was spent on Bitcoin by {by}");
+    }
+
+    Ok(())
 }
 
 fn verify_input<C: Verification>(
@@ -163,10 +286,8 @@ fn verify_input<C: Verification>(
     }
 
     // Checkpoint and Ark transactions spend a VTXO through one of its tapleaves, cosigned by the
-    // operator.
-    // ponytail: checks the leaf is committed to, names the operator, and every CHECKSIG key in it
-    // signed; timelocks and hash conditions in the leaf are not evaluated. A script interpreter
-    // would close that.
+    // operator. The leaf has to be committed to, name the operator, carry a signature for every
+    // CHECKSIG key, and have whatever else it asks for met by this transaction.
     for (control_block, (leaf_script, leaf_version)) in &input.tap_scripts {
         let pubkeys = ark_core::script::extract_checksig_pubkeys(leaf_script);
         if !pubkeys.iter().any(|pk| operator_keys.contains(pk))
@@ -204,10 +325,106 @@ fn verify_input<C: Verification>(
             .with_context(|| format!("script-path signature by {pk} does not verify"))?;
         }
 
-        return Ok(());
+        return verify_leaf_conditions(leaf_script, psbt, index);
     }
 
     bail!("no tapleaf of the spent output is signed by its keys and the operator")
+}
+
+/// Check what a signed tapleaf asks for besides signatures, since Bitcoin rejects a spend whose
+/// leaf is signed but not satisfied.
+///
+/// This is not a script interpreter. It knows the shapes Arkade's cosigned leaves are built
+/// from: hash locks and absolute timelocks first, then the keys, `CHECKSIGVERIFY` for all but the
+/// last. A leaf of any other shape is refused rather than assumed spendable.
+fn verify_leaf_conditions(leaf_script: &ScriptBuf, psbt: &Psbt, index: usize) -> Result<()> {
+    use Instruction::{Op, PushBytes};
+
+    let instructions = leaf_script
+        .instructions()
+        .collect::<Result<Vec<_>, _>>()
+        .context("tapleaf is not a valid script")?;
+    // The finalized witness carries these above the signatures, last element on top.
+    let mut condition_witness = condition_witness(&psbt.inputs[index])?;
+    let mut rest = instructions.as_slice();
+
+    loop {
+        rest = match rest {
+            [
+                Op(OP_HASH160),
+                PushBytes(hash),
+                Op(OP_EQUALVERIFY),
+                tail @ ..,
+            ]
+            | [
+                Op(OP_HASH160),
+                PushBytes(hash),
+                Op(OP_EQUAL),
+                Op(OP_VERIFY),
+                tail @ ..,
+            ] => {
+                let preimage = condition_witness
+                    .pop()
+                    .context("tapleaf is hash-locked and the spend has no preimage")?;
+                ensure!(
+                    preimage.len() <= MAX_SCRIPT_ELEMENT_SIZE,
+                    "preimage is {} bytes, more than Bitcoin lets a witness element be",
+                    preimage.len()
+                );
+                ensure!(
+                    hash160::Hash::hash(&preimage).as_byte_array() == hash.as_bytes(),
+                    "preimage does not open the tapleaf's hash lock"
+                );
+                tail
+            }
+            [locktime, Op(OP_CLTV), Op(OP_DROP), tail @ ..] => {
+                let required = locktime
+                    .script_num()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .map(LockTime::from_consensus)
+                    .context("tapleaf has a malformed timelock")?;
+                let lock_time = psbt.unsigned_tx.lock_time;
+                ensure!(
+                    required.is_same_unit(lock_time)
+                        && required.to_consensus_u32() <= lock_time.to_consensus_u32(),
+                    "tapleaf is locked until {required} and the spend is valid from {lock_time}"
+                );
+                ensure!(
+                    psbt.unsigned_tx.input[index].sequence != Sequence::MAX,
+                    "tapleaf is timelocked and the spend's sequence disables timelocks"
+                );
+                tail
+            }
+            _ => break,
+        };
+    }
+    ensure!(
+        condition_witness.is_empty(),
+        "spend carries witness elements its tapleaf does not consume"
+    );
+
+    loop {
+        rest = match rest {
+            [PushBytes(key), Op(OP_CHECKSIG)] if key.len() == 32 => return Ok(()),
+            [PushBytes(key), Op(OP_CHECKSIGVERIFY), tail @ ..] if key.len() == 32 => tail,
+            _ => bail!("tapleaf {leaf_script} has conditions this verifier cannot check"),
+        };
+    }
+}
+
+/// The extra witness elements a spend supplies for its leaf's conditions, such as a VHTLC
+/// preimage, as Arkade files them in the PSBT.
+fn condition_witness(input: &psbt::Input) -> Result<Vec<Vec<u8>>> {
+    let key = psbt::raw::Key {
+        type_value: 222,
+        key: VTXO_CONDITION_KEY.to_vec(),
+    };
+
+    match input.unknown.get(&key) {
+        Some(encoded) => bitcoin::consensus::deserialize(encoded)
+            .context("condition witness in the PSBT is malformed"),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn taproot_output_key(script: &ScriptBuf) -> Result<XOnlyPublicKey> {
@@ -220,17 +437,32 @@ mod tests {
     use super::*;
 
     use ark_core::server::{ChainedTxType, VtxoChain};
-    use bitcoin::absolute::LockTime;
+    use bitcoin::TxIn;
     use bitcoin::key::{Keypair, TapTweak};
-    use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY};
+    use bitcoin::opcodes::all::OP_CSV;
     use bitcoin::script::Builder;
     use bitcoin::secp256k1::All;
     use bitcoin::sighash::TapSighashType;
     use bitcoin::taproot::{self, LeafVersion, TaprootBuilder, TaprootSpendInfo};
     use bitcoin::transaction::Version;
-    use bitcoin::{Transaction, TxIn};
 
     const VALUE: Amount = Amount::from_sat(10_000);
+    const TIP_HEIGHT: u32 = 800_000;
+    const TIP_TIME: u32 = 1_700_000_001;
+
+    fn unspent(txout: TxOut) -> L1Output {
+        L1Output {
+            txout,
+            spent_by: None,
+        }
+    }
+
+    fn spent(txout: TxOut, by: Txid) -> L1Output {
+        L1Output {
+            txout,
+            spent_by: Some(by),
+        }
+    }
 
     /// Commitment output -> batch-tree leaf (key path) -> Ark transaction (owner + operator
     /// tapleaf) paying the escrow, the shape of a preconfirmed escrow deposit.
@@ -243,10 +475,27 @@ mod tests {
         tree: Psbt,
         ark: Psbt,
         escrow_script: ScriptBuf,
+        /// The tapleaf the Ark transaction spends the VTXO through.
+        leaf: ScriptBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
+            Self::spending_through(|owner, operator| {
+                Builder::new()
+                    .push_x_only_key(&owner)
+                    .push_opcode(OP_CHECKSIGVERIFY)
+                    .push_x_only_key(&operator)
+                    .push_opcode(OP_CHECKSIG)
+                    .into_script()
+            })
+        }
+
+        /// A deposit whose VTXO is spent through the leaf `leaf` builds from the owner's and the
+        /// operator's keys.
+        fn spending_through(
+            leaf: impl FnOnce(XOnlyPublicKey, XOnlyPublicKey) -> ScriptBuf,
+        ) -> Self {
             let secp = Secp256k1::new();
             let [cosigner, owner, operator, escrow] =
                 std::array::from_fn(|_| Keypair::new(&secp, &mut rand::thread_rng()));
@@ -258,7 +507,8 @@ mod tests {
             };
             let escrow_script = ScriptBuf::new_p2tr(&secp, escrow.x_only_public_key().0, None);
 
-            let (_, vtxo_info) = vtxo_leaf(&secp, &owner, &operator);
+            let leaf = leaf(owner.x_only_public_key().0, operator.x_only_public_key().0);
+            let vtxo_info = leaf_info(&secp, &owner, &leaf);
             let vtxo_output = TxOut {
                 value: VALUE,
                 script_pubkey: ScriptBuf::new_p2tr_tweaked(vtxo_info.output_key()),
@@ -280,6 +530,7 @@ mod tests {
                 tree,
                 ark,
                 escrow_script,
+                leaf,
             };
             fixture.sign_tree(&cosigner);
             fixture.sign_ark(&owner);
@@ -311,7 +562,8 @@ mod tests {
         /// Sign the Ark transaction through the owner + operator leaf; `owner_signer` produces
         /// the signature filed under the owner's key.
         fn sign_ark(&mut self, owner_signer: &Keypair) {
-            let (script, info) = vtxo_leaf(&self.secp, &self.owner, &self.operator);
+            let script = self.leaf.clone();
+            let info = leaf_info(&self.secp, &self.owner, &script);
             let control_block = info
                 .control_block(&(script.clone(), LeafVersion::TapScript))
                 .unwrap();
@@ -330,6 +582,7 @@ mod tests {
             let owner_sig = self.signature(sighash, owner_signer);
             let operator_sig = self.signature(sighash, &self.operator);
             let input = &mut self.ark.inputs[0];
+            input.tap_script_sigs.clear();
             input
                 .tap_scripts
                 .insert(control_block, (script, LeafVersion::TapScript));
@@ -365,8 +618,8 @@ mod tests {
             }
         }
 
-        fn l1_outputs(&self) -> HashMap<OutPoint, TxOut> {
-            HashMap::from([(self.commitment, self.batch_output.clone())])
+        fn l1_outputs(&self) -> HashMap<OutPoint, L1Output> {
+            HashMap::from([(self.commitment, unspent(self.batch_output.clone()))])
         }
 
         fn txs(&self) -> Vec<Psbt> {
@@ -377,15 +630,15 @@ mod tests {
             vec![self.operator.x_only_public_key().0]
         }
 
-        fn verify(&self) -> Result<Vec<Txid>> {
+        fn verify(&self) -> Result<ExitPath> {
             self.verify_with(&self.txs(), &self.l1_outputs())
         }
 
         fn verify_with(
             &self,
             txs: &[Psbt],
-            l1_outputs: &HashMap<OutPoint, TxOut>,
-        ) -> Result<Vec<Txid>> {
+            l1_outputs: &HashMap<OutPoint, L1Output>,
+        ) -> Result<ExitPath> {
             self.verify_vtxo(
                 &self.escrow_script,
                 VALUE,
@@ -400,16 +653,20 @@ mod tests {
             script: &ScriptBuf,
             amount: Amount,
             txs: &[Psbt],
-            l1_outputs: &HashMap<OutPoint, TxOut>,
+            l1_outputs: &HashMap<OutPoint, L1Output>,
             operator_keys: &[XOnlyPublicKey],
-        ) -> Result<Vec<Txid>> {
+        ) -> Result<ExitPath> {
             verify_vtxo_chain(
                 OutPoint::new(self.ark_txid(), 0),
                 script,
                 amount,
                 &self.chains(),
                 txs,
-                l1_outputs,
+                &BitcoinView {
+                    outputs: l1_outputs.clone(),
+                    height: TIP_HEIGHT,
+                    median_time_past: TIP_TIME,
+                },
                 operator_keys,
             )
         }
@@ -427,12 +684,63 @@ mod tests {
             .push_x_only_key(&operator.x_only_public_key().0)
             .push_opcode(OP_CHECKSIG)
             .into_script();
-        let info = TaprootBuilder::new()
+        let info = leaf_info(secp, owner, &script);
+        (script, info)
+    }
+
+    fn leaf_info(secp: &Secp256k1<All>, owner: &Keypair, script: &ScriptBuf) -> TaprootSpendInfo {
+        TaprootBuilder::new()
             .add_leaf(0, script.clone())
             .unwrap()
             .finalize(secp, owner.x_only_public_key().0)
-            .unwrap();
-        (script, info)
+            .unwrap()
+    }
+
+    /// `conditions`, then the owner's and the operator's signatures.
+    fn conditional_leaf(
+        conditions: Builder,
+    ) -> impl FnOnce(XOnlyPublicKey, XOnlyPublicKey) -> ScriptBuf {
+        move |owner, operator| {
+            conditions
+                .push_x_only_key(&owner)
+                .push_opcode(OP_CHECKSIGVERIFY)
+                .push_x_only_key(&operator)
+                .push_opcode(OP_CHECKSIG)
+                .into_script()
+        }
+    }
+
+    fn hash_lock(preimage: &[u8]) -> Builder {
+        Builder::new()
+            .push_opcode(OP_HASH160)
+            .push_slice(hash160::Hash::hash(preimage).to_byte_array())
+            .push_opcode(OP_EQUAL)
+            .push_opcode(OP_VERIFY)
+    }
+
+    fn timelock(height: i64) -> Builder {
+        Builder::new()
+            .push_int(height)
+            .push_opcode(OP_CLTV)
+            .push_opcode(OP_DROP)
+    }
+
+    fn reveal(fixture: &mut Fixture, preimage: &[u8]) {
+        fixture.ark.inputs[0].unknown.insert(
+            psbt::raw::Key {
+                type_value: 222,
+                key: VTXO_CONDITION_KEY.to_vec(),
+            },
+            bitcoin::consensus::serialize(&vec![preimage.to_vec()]),
+        );
+    }
+
+    /// Set the Ark transaction's locktime and sign it again, as the locktime is signed over.
+    fn spend_at(fixture: &mut Fixture, height: u32, sequence: Sequence) {
+        fixture.ark.unsigned_tx.lock_time = LockTime::from_consensus(height);
+        fixture.ark.unsigned_tx.input[0].sequence = sequence;
+        let owner = fixture.owner;
+        fixture.sign_ark(&owner);
     }
 
     fn tx(spent: OutPoint, output: TxOut) -> Transaction {
@@ -456,7 +764,7 @@ mod tests {
         }
     }
 
-    fn assert_rejected(result: Result<Vec<Txid>>, reason: &str) {
+    fn assert_rejected(result: Result<ExitPath>, reason: &str) {
         let error = format!("{:#}", result.expect_err("chain should be rejected"));
         assert!(error.contains(reason), "{error}");
     }
@@ -469,7 +777,20 @@ mod tests {
     fn accepts_a_signed_path_from_a_bitcoin_output() {
         let fixture = Fixture::new();
 
-        assert_eq!(fixture.verify().unwrap(), vec![fixture.commitment.txid]);
+        assert_eq!(fixture.verify().unwrap().anchors, vec![fixture.commitment]);
+    }
+
+    #[test]
+    fn names_the_transaction_allowed_to_spend_each_output_on_the_path() {
+        let fixture = Fixture::new();
+
+        assert_eq!(
+            fixture.verify().unwrap().spends,
+            vec![
+                (fixture.commitment, fixture.tree_txid()),
+                (OutPoint::new(fixture.tree_txid(), 0), fixture.ark_txid()),
+            ]
+        );
     }
 
     #[test]
@@ -500,7 +821,7 @@ mod tests {
             &fixture.operator_keys(),
         );
 
-        assert_rejected(result, "not the reported");
+        assert_rejected(result, "not the expected");
     }
 
     #[test]
@@ -518,10 +839,10 @@ mod tests {
         let mut l1_outputs = fixture.l1_outputs();
         l1_outputs.insert(
             fixture.commitment,
-            TxOut {
+            unspent(TxOut {
                 value: VALUE,
                 script_pubkey: fixture.escrow_script.clone(),
-            },
+            }),
         );
 
         let result = fixture.verify_with(&fixture.txs(), &l1_outputs);
@@ -533,7 +854,7 @@ mod tests {
     fn rejects_value_the_bitcoin_output_does_not_hold() {
         let fixture = Fixture::new();
         let mut l1_outputs = fixture.l1_outputs();
-        l1_outputs.get_mut(&fixture.commitment).unwrap().value = VALUE / 2;
+        l1_outputs.get_mut(&fixture.commitment).unwrap().txout.value = VALUE / 2;
 
         let result = fixture.verify_with(&fixture.txs(), &l1_outputs);
 
@@ -636,10 +957,242 @@ mod tests {
             VALUE,
             &chains,
             &fixture.txs(),
-            &fixture.l1_outputs(),
+            &BitcoinView {
+                outputs: fixture.l1_outputs(),
+                height: TIP_HEIGHT,
+                median_time_past: TIP_TIME,
+            },
             &fixture.operator_keys(),
         );
 
         assert_rejected(result, "more than");
+    }
+
+    #[test]
+    fn accepts_a_hash_locked_spend_that_reveals_the_preimage() {
+        let mut fixture = Fixture::spending_through(conditional_leaf(hash_lock(b"secret")));
+        reveal(&mut fixture, b"secret");
+
+        assert_eq!(fixture.verify().unwrap().anchors, vec![fixture.commitment]);
+    }
+
+    #[test]
+    fn rejects_a_hash_locked_spend_without_the_preimage() {
+        let fixture = Fixture::spending_through(conditional_leaf(hash_lock(b"secret")));
+
+        assert_rejected(fixture.verify(), "has no preimage");
+    }
+
+    #[test]
+    fn rejects_a_hash_locked_spend_with_another_preimage() {
+        let mut fixture = Fixture::spending_through(conditional_leaf(hash_lock(b"secret")));
+        reveal(&mut fixture, b"guess");
+
+        assert_rejected(fixture.verify(), "does not open");
+    }
+
+    #[test]
+    fn rejects_a_preimage_too_long_for_a_witness() {
+        let preimage = [7; MAX_SCRIPT_ELEMENT_SIZE + 1];
+        let mut fixture = Fixture::spending_through(conditional_leaf(hash_lock(&preimage)));
+        reveal(&mut fixture, &preimage);
+
+        assert_rejected(fixture.verify(), "more than Bitcoin lets");
+    }
+
+    #[test]
+    fn rejects_witness_elements_the_leaf_does_not_consume() {
+        let mut fixture = Fixture::new();
+        reveal(&mut fixture, b"secret");
+
+        assert_rejected(fixture.verify(), "does not consume");
+    }
+
+    #[test]
+    fn accepts_a_timelocked_spend_once_the_lock_has_passed() {
+        let mut fixture = Fixture::spending_through(conditional_leaf(timelock(800_000)));
+        spend_at(&mut fixture, 800_000, Sequence::ENABLE_LOCKTIME_NO_RBF);
+
+        assert_eq!(fixture.verify().unwrap().anchors, vec![fixture.commitment]);
+    }
+
+    #[test]
+    fn rejects_a_timelocked_spend_valid_before_the_lock() {
+        let mut fixture = Fixture::spending_through(conditional_leaf(timelock(800_000)));
+        spend_at(&mut fixture, 799_999, Sequence::ENABLE_LOCKTIME_NO_RBF);
+
+        assert_rejected(fixture.verify(), "is locked until");
+    }
+
+    #[test]
+    fn rejects_a_timelock_measured_in_another_unit() {
+        let mut fixture = Fixture::spending_through(conditional_leaf(timelock(800_000)));
+        spend_at(
+            &mut fixture,
+            1_700_000_000,
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        assert_rejected(fixture.verify(), "is locked until");
+    }
+
+    #[test]
+    fn rejects_a_timelocked_spend_whose_sequence_disables_timelocks() {
+        let mut fixture = Fixture::spending_through(conditional_leaf(timelock(800_000)));
+        spend_at(&mut fixture, 800_000, Sequence::MAX);
+
+        assert_rejected(fixture.verify(), "disables timelocks");
+    }
+
+    #[test]
+    fn rejects_a_leaf_with_a_condition_it_cannot_check() {
+        let relative_delay = Builder::new()
+            .push_int(144)
+            .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP);
+        let fixture = Fixture::spending_through(conditional_leaf(relative_delay));
+
+        assert_rejected(fixture.verify(), "cannot check");
+    }
+
+    #[test]
+    fn rejects_a_leaf_that_leaves_more_than_one_result() {
+        let fixture = Fixture::spending_through(|owner, operator| {
+            Builder::new()
+                .push_x_only_key(&owner)
+                .push_opcode(OP_CHECKSIG)
+                .push_x_only_key(&operator)
+                .push_opcode(OP_CHECKSIG)
+                .into_script()
+        });
+
+        assert_rejected(fixture.verify(), "cannot check");
+    }
+
+    #[test]
+    fn rejects_a_transaction_bitcoin_would_not_take_yet() {
+        let mut fixture = Fixture::new();
+        spend_at(
+            &mut fixture,
+            TIP_HEIGHT + 1,
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        assert_rejected(fixture.verify(), "cannot be published before");
+    }
+
+    #[test]
+    fn rejects_a_time_lock_the_median_time_has_not_passed() {
+        let mut fixture = Fixture::new();
+        spend_at(&mut fixture, TIP_TIME, Sequence::ENABLE_LOCKTIME_NO_RBF);
+
+        assert_rejected(fixture.verify(), "cannot be published before");
+    }
+
+    #[test]
+    fn accepts_a_locktime_the_sequence_switches_off() {
+        let mut fixture = Fixture::new();
+        spend_at(&mut fixture, TIP_HEIGHT + 1, Sequence::MAX);
+
+        assert_eq!(fixture.verify().unwrap().anchors, vec![fixture.commitment]);
+    }
+
+    #[test]
+    fn rejects_a_transaction_that_waits_on_its_parents_age() {
+        let mut fixture = Fixture::new();
+        spend_at(&mut fixture, 0, Sequence::from_height(144));
+
+        assert_rejected(fixture.verify(), "relative timelock");
+    }
+
+    #[test]
+    fn rejects_a_batch_output_something_else_spent() {
+        let fixture = Fixture::new();
+        let mut l1_outputs = fixture.l1_outputs();
+        l1_outputs.get_mut(&fixture.commitment).unwrap().spent_by =
+            Some(Txid::from_byte_array([9; 32]));
+
+        let result = fixture.verify_with(&fixture.txs(), &l1_outputs);
+
+        assert_rejected(result, "has no exit path");
+    }
+
+    /// Bitcoin after the batch tree was published: the batch output went to the tree transaction,
+    /// whose output is the VTXO the Ark transaction spends.
+    fn unrolled(fixture: &Fixture, vtxo: L1Output) -> HashMap<OutPoint, L1Output> {
+        HashMap::from([
+            (
+                fixture.commitment,
+                spent(fixture.batch_output.clone(), fixture.tree_txid()),
+            ),
+            (OutPoint::new(fixture.tree_txid(), 0), vtxo),
+        ])
+    }
+
+    #[test]
+    fn accepts_a_path_partly_published_by_its_own_transactions() {
+        let fixture = Fixture::new();
+        let vtxo = unspent(fixture.tree.unsigned_tx.output[0].clone());
+
+        let result = fixture.verify_with(&fixture.txs(), &unrolled(&fixture, vtxo));
+
+        assert_eq!(result.unwrap().anchors, vec![fixture.commitment]);
+    }
+
+    #[test]
+    fn rejects_a_published_output_its_owner_took_back() {
+        let fixture = Fixture::new();
+        let exit = Txid::from_byte_array([9; 32]);
+        let vtxo = spent(fixture.tree.unsigned_tx.output[0].clone(), exit);
+
+        let result = fixture.verify_with(&fixture.txs(), &unrolled(&fixture, vtxo));
+
+        assert_rejected(result, "has no exit path");
+    }
+
+    #[test]
+    fn rejects_a_published_transaction_whose_outputs_were_not_read() {
+        let fixture = Fixture::new();
+        let mut l1_outputs = fixture.l1_outputs();
+        l1_outputs.get_mut(&fixture.commitment).unwrap().spent_by = Some(fixture.tree_txid());
+
+        let result = fixture.verify_with(&fixture.txs(), &l1_outputs);
+
+        assert_rejected(result, "is needed");
+    }
+
+    #[test]
+    fn rejects_an_escrow_vtxo_already_spent_on_bitcoin() {
+        let fixture = Fixture::new();
+        let escrow = OutPoint::new(fixture.ark_txid(), 0);
+        let vtxo = spent(
+            fixture.tree.unsigned_tx.output[0].clone(),
+            fixture.ark_txid(),
+        );
+        let mut l1_outputs = unrolled(&fixture, vtxo);
+        l1_outputs.insert(
+            escrow,
+            spent(
+                fixture.ark.unsigned_tx.output[0].clone(),
+                Txid::from_byte_array([9; 32]),
+            ),
+        );
+
+        let result = fixture.verify_with(&fixture.txs(), &l1_outputs);
+
+        assert_rejected(result, "was spent on Bitcoin by");
+    }
+
+    #[test]
+    fn rejects_a_published_escrow_vtxo_nobody_looked_at() {
+        let fixture = Fixture::new();
+        let vtxo = spent(
+            fixture.tree.unsigned_tx.output[0].clone(),
+            fixture.ark_txid(),
+        );
+
+        let result = fixture.verify_with(&fixture.txs(), &unrolled(&fixture, vtxo));
+
+        assert_rejected(result, "is needed");
     }
 }
