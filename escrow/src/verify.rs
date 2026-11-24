@@ -142,6 +142,7 @@ pub fn verify_vtxo_chain(
     let secp = Secp256k1::verification_only();
     let mut anchors = Vec::new();
     let mut spends = Vec::new();
+    let mut seen = HashSet::new();
 
     for txid in &branch {
         let psbt = branch_txs[txid];
@@ -149,6 +150,12 @@ pub fn verify_vtxo_chain(
 
         for input in &psbt.unsigned_tx.input {
             let spent = input.previous_output;
+            // Bitcoin spends an output once: not twice in one transaction, and not in two
+            // transactions of the same path.
+            ensure!(
+                seen.insert(spent),
+                "{txid} spends {spent}, which the path already spends"
+            );
             spends.push((spent, *txid));
             let prevout = match branch_txs.get(&spent.txid) {
                 Some(parent) => parent.unsigned_tx.output.get(spent.vout as usize).cloned(),
@@ -859,6 +866,17 @@ mod tests {
         let result = fixture.verify_with(&fixture.txs(), &l1_outputs);
 
         assert_rejected(result, "spends only");
+    }
+
+    #[test]
+    fn rejects_a_transaction_that_spends_an_output_twice() {
+        let mut fixture = Fixture::new();
+        let input = fixture.ark.unsigned_tx.input[0].clone();
+        fixture.ark.unsigned_tx.input.push(input);
+        let signed = fixture.ark.inputs[0].clone();
+        fixture.ark.inputs.push(signed);
+
+        assert_rejected(fixture.verify(), "already spends");
     }
 
     #[test]
